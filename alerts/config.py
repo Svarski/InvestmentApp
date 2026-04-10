@@ -11,18 +11,16 @@ class AlertSettings:
     """Thresholds, channels, and delivery settings for alerts."""
 
     # Rule thresholds
-    drawdown_levels: Tuple[float, ...] = (-1.0, -2.0, -3.0)
+    drawdown_levels: Tuple[float, ...] = (-5.0, -10.0, -20.0, -30.0, -40.0, -50.0)
     drawdown_alert_symbols: Tuple[str, ...] = ("VWCE", "CNDX", "SPY", "QQQ")
     portfolio_drop_levels: Tuple[float, ...] = (-5.0, -10.0, -20.0)
-    vix_spike_threshold: float = 25.0
+    vix_spike_threshold: float = 30.0
 
     # Reset hysteresis to avoid notification flapping/spam
     drawdown_reset_buffer: float = 5.0
     portfolio_reset_buffer: float = 2.0
     vix_reset_buffer: float = 3.0
 
-    # Delivery channels: "telegram", "email", "both", "none"
-    channel: str = "none"
 
     # Retry behavior
     max_retries: int = 2
