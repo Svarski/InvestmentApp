@@ -1,0 +1,38 @@
+{
+  "alerts": {
+    "VWCE_drawdown": {
+      "triggered_levels": [
+        -3.0,
+        -2.0,
+        -1.0
+      ]
+    },
+    "CNDX_drawdown": {
+      "triggered_levels": [
+        -3.0,
+        -2.0,
+        -1.0
+      ]
+    },
+    "SPY_drawdown": {
+      "triggered_levels": [
+        -3.0,
+        -2.0,
+        -1.0
+      ]
+    },
+    "QQQ_drawdown": {
+      "triggered_levels": [
+        -3.0,
+        -2.0,
+        -1.0
+      ]
+    },
+    "vix_spike": {
+      "triggered_levels": [
+        25.0
+      ]
+    }
+  },
+  "metrics": {}
+}

@@ -1,0 +1,448 @@
+"""Standalone alert worker process (UI-independent)."""
+
+from __future__ import annotations
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+import argparse
+import json
+import logging
+import os
+import random
+import signal
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import List, Optional
+
+from alerts import AlertEngine, AlertNotifier, AlertSettings, AlertState
+from alerts.settings_loader import get_alert_settings
+from config import DEFAULT_LOOKBACK_PERIOD
+from services.reports.weekly_digest import (
+    WeeklyDigestState,
+    build_weekly_digest_text,
+    mark_weekly_digest_sent,
+    should_send_weekly_digest,
+    update_weekly_digest_state,
+)
+from services.market_data import build_market_overview, fetch_history_for_ticker_uncached
+
+logger = logging.getLogger("investment_worker")
+
+@dataclass(frozen=True)
+class WorkerConfig:
+    """Runtime configuration for the background alert worker."""
+
+    interval_seconds: int = 300
+    log_level: str = "INFO"
+    run_once: bool = False
+    dry_run: bool = False
+    lookback_period: str = DEFAULT_LOOKBACK_PERIOD
+    portfolio_value: Optional[float] = None
+    heartbeat_file: Optional[str] = None
+    state_file: str = "./data/alert_state.json"
+    sleep_jitter_seconds: int = 10
+    fetch_retry_delay_seconds: float = 3.0
+    weekly_summary_enabled: bool = False
+    weekly_summary_channel: str = "email"
+    weekly_summary_day: str = "monday"
+    weekly_summary_hour: int = 9
+    weekly_summary_timezone: str = "UTC"
+    weekly_summary_email_to: Optional[str] = None
+    weekly_summary_state_file: str = "./data/weekly_digest_state.json"
+
+
+@dataclass(frozen=True)
+class CycleResult:
+    """One worker cycle outcome used for persistence and weekly digest decisions."""
+
+    success: bool
+    alerts: List[object]
+    market_df: object
+    portfolio_drop_pct: Optional[float]
+
+
+def _parse_bool(value: Optional[str], default: bool = False) -> bool:
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _parse_float(value: Optional[str]) -> Optional[float]:
+    if value is None or value.strip() == "":
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def load_worker_config_from_env() -> WorkerConfig:
+    """Build worker config from environment variables."""
+    interval_raw = os.getenv("WORKER_INTERVAL_SECONDS", "300")
+    try:
+        interval = max(1, int(interval_raw))
+    except ValueError:
+        interval = 300
+
+    jitter_raw = os.getenv("WORKER_SLEEP_JITTER_SECONDS", "10")
+    retry_delay_raw = os.getenv("WORKER_FETCH_RETRY_DELAY_SECONDS", "3.0")
+    try:
+        jitter_seconds = max(0, int(jitter_raw))
+    except ValueError:
+        jitter_seconds = 10
+    try:
+        fetch_retry_delay_seconds = max(0.0, float(retry_delay_raw))
+    except ValueError:
+        fetch_retry_delay_seconds = 3.0
+
+    weekly_hour_raw = os.getenv("WEEKLY_SUMMARY_HOUR", "9")
+    try:
+        weekly_hour = min(23, max(0, int(weekly_hour_raw)))
+    except ValueError:
+        weekly_hour = 9
+    weekly_channel = os.getenv("WEEKLY_SUMMARY_CHANNEL", "email").strip().lower()
+    weekly_channel = weekly_channel if weekly_channel in {"email", "none"} else "email"
+
+    return WorkerConfig(
+        interval_seconds=interval,
+        log_level=os.getenv("WORKER_LOG_LEVEL", "INFO"),
+        run_once=_parse_bool(os.getenv("WORKER_RUN_ONCE"), default=False),
+        dry_run=_parse_bool(os.getenv("WORKER_DRY_RUN"), default=False),
+        lookback_period=os.getenv("WORKER_LOOKBACK_PERIOD", DEFAULT_LOOKBACK_PERIOD),
+        portfolio_value=_parse_float(os.getenv("WORKER_PORTFOLIO_VALUE")),
+        heartbeat_file=os.getenv("WORKER_HEARTBEAT_FILE"),
+        state_file=os.getenv("ALERT_STATE_FILE", "./data/alert_state.json"),
+        sleep_jitter_seconds=jitter_seconds,
+        fetch_retry_delay_seconds=fetch_retry_delay_seconds,
+        weekly_summary_enabled=_parse_bool(os.getenv("WEEKLY_SUMMARY_ENABLED"), default=False),
+        weekly_summary_channel=weekly_channel,
+        weekly_summary_day=os.getenv("WEEKLY_SUMMARY_DAY", "monday"),
+        weekly_summary_hour=weekly_hour,
+        weekly_summary_timezone=os.getenv("WEEKLY_SUMMARY_TIMEZONE", "UTC"),
+        weekly_summary_email_to=os.getenv("WEEKLY_SUMMARY_EMAIL_TO"),
+        weekly_summary_state_file=os.getenv("WEEKLY_SUMMARY_STATE_FILE", "./data/weekly_digest_state.json"),
+    )
+
+
+def load_alert_settings_from_env() -> AlertSettings:
+    """Backward-compatible wrapper around the shared loader."""
+    return get_alert_settings()
+
+
+def configure_logging(log_level: str) -> None:
+    """Configure Docker-friendly logging to stdout/stderr."""
+    logging.basicConfig(
+        level=getattr(logging, log_level.upper(), logging.INFO),
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        force=True,
+    )
+
+
+def write_heartbeat(path: Optional[str], *, success: bool) -> None:
+    """Write heartbeat JSON with last success/failure timestamps."""
+    if not path:
+        return
+    try:
+        timestamp = datetime.now(timezone.utc).isoformat()
+        payload = {"last_success_timestamp": None, "last_failure_timestamp": None}
+
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    existing = json.load(f)
+                if isinstance(existing, dict):
+                    payload["last_success_timestamp"] = existing.get("last_success_timestamp")
+                    payload["last_failure_timestamp"] = existing.get("last_failure_timestamp")
+            except Exception:
+                logger.warning("Heartbeat file exists but could not be read. path=%s", path)
+
+        if success:
+            payload["last_success_timestamp"] = timestamp
+        else:
+            payload["last_failure_timestamp"] = timestamp
+
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+    except Exception:
+        logger.exception("Failed to write heartbeat file path=%s", path)
+
+
+def run_cycle(engine: AlertEngine, notifier: AlertNotifier, config: WorkerConfig) -> CycleResult:
+    """Run one worker cycle safely: fetch, evaluate, notify, log."""
+    logger.info("Cycle started.")
+
+    market_df, fetch_messages = build_market_overview(
+        period=config.lookback_period,
+        history_fetcher=fetch_history_for_ticker_uncached,
+    )
+    if market_df.empty:
+        logger.warning(
+            "Market dataframe empty on first attempt. Retrying once in %.1fs...",
+            config.fetch_retry_delay_seconds,
+        )
+        if config.fetch_retry_delay_seconds > 0:
+            time.sleep(config.fetch_retry_delay_seconds)
+        market_df, fetch_messages = build_market_overview(
+            period=config.lookback_period,
+            history_fetcher=fetch_history_for_ticker_uncached,
+        )
+
+    logger.info(
+        "Market data fetched. rows=%s warnings=%s",
+        len(market_df.index),
+        len(fetch_messages),
+    )
+    for message in fetch_messages:
+        logger.warning("Market data warning: %s", message)
+
+    if market_df.empty:
+        logger.warning("Market dataframe is empty. Skipping alert evaluation for this cycle.")
+        return CycleResult(success=False, alerts=[], market_df=market_df, portfolio_drop_pct=None)
+
+    if config.portfolio_value is None:
+        logger.info("Portfolio value not configured for worker; portfolio drop alerts may not trigger.")
+
+    alerts = engine.evaluate(market_df=market_df, portfolio_value=config.portfolio_value)
+    portfolio_drop_pct = _calculate_portfolio_drop_pct(engine=engine, portfolio_value=config.portfolio_value)
+    breakdown = {"drawdown": 0, "portfolio": 0, "vix": 0, "other": 0}
+    for alert in alerts:
+        if alert.type == "market_drawdown":
+            breakdown["drawdown"] += 1
+        elif alert.type == "portfolio_drop":
+            breakdown["portfolio"] += 1
+        elif alert.type == "vix_spike":
+            breakdown["vix"] += 1
+        else:
+            breakdown["other"] += 1
+
+    logger.info(
+        "Alert evaluation completed. generated_alerts=%s breakdown=%s",
+        len(alerts),
+        breakdown,
+    )
+
+    if not alerts:
+        write_heartbeat(config.heartbeat_file, success=True)
+        return CycleResult(success=True, alerts=[], market_df=market_df, portfolio_drop_pct=portfolio_drop_pct)
+
+    if config.dry_run:
+        logger.info("Dry run enabled. Skipping notification send for %s alerts.", len(alerts))
+        logger.info(
+            "Notification metrics. attempted_alerts=%s sent_alerts=%s failed_alerts=%s",
+            len(alerts),
+            0,
+            len(alerts),
+        )
+        write_heartbeat(config.heartbeat_file, success=True)
+        return CycleResult(success=True, alerts=alerts, market_df=market_df, portfolio_drop_pct=portfolio_drop_pct)
+
+    stats = notifier.send_alerts_with_stats(alerts)
+    failed_alerts = max(0, stats.attempted_alerts - stats.sent_alerts)
+    logger.info(
+        "Notification dispatch completed. attempted_alerts=%s sent_alerts=%s failed_alerts=%s",
+        stats.attempted_alerts,
+        stats.sent_alerts,
+        failed_alerts,
+    )
+    write_heartbeat(config.heartbeat_file, success=True)
+    return CycleResult(success=True, alerts=alerts, market_df=market_df, portfolio_drop_pct=portfolio_drop_pct)
+
+
+def sleep_with_logging(stop_event: threading.Event, seconds: int, jitter_seconds: int) -> None:
+    """Sleep until timeout or shutdown event, with fast interruption support."""
+    jitter = random.randint(-jitter_seconds, jitter_seconds) if jitter_seconds > 0 else 0
+    sleep_for = max(1, seconds + jitter)
+    logger.info(
+        "Sleeping for %s seconds before next cycle (base=%s jitter=%+s).",
+        sleep_for,
+        seconds,
+        jitter,
+    )
+    stop_event.wait(timeout=sleep_for)
+
+
+def run_worker(config: WorkerConfig, alert_settings: AlertSettings) -> None:
+    """Run the worker main loop until stopped."""
+    stop_event = threading.Event()
+
+    def _handle_shutdown(signum: int, _frame) -> None:
+        logger.info("Received shutdown signal=%s. Stopping worker...", signum)
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, _handle_shutdown)
+    signal.signal(signal.SIGTERM, _handle_shutdown)
+
+    loaded_state = AlertState.load_from_file(config.state_file)
+    weekly_digest_state = WeeklyDigestState.load_from_file(config.weekly_summary_state_file)
+    engine = AlertEngine(settings=alert_settings, state=loaded_state)
+    notifier = AlertNotifier(settings=alert_settings)
+    logger.info("Using AlertNotifier facade backed by MultiNotifier.")
+
+    logger.info(
+        "Worker started. interval=%ss run_once=%s dry_run=%s channel=%s",
+        config.interval_seconds,
+        config.run_once,
+        config.dry_run,
+        alert_settings.channel,
+    )
+    logger.info("Alert state file path=%s", config.state_file)
+    logger.info(
+        "Weekly digest config: enabled=%s channel=%s day=%s hour=%s tz=%s state_file=%s",
+        config.weekly_summary_enabled,
+        config.weekly_summary_channel,
+        config.weekly_summary_day,
+        config.weekly_summary_hour,
+        config.weekly_summary_timezone,
+        config.weekly_summary_state_file,
+    )
+
+    while not stop_event.is_set():
+        logger.info("Beginning worker cycle.")
+        try:
+            cycle_result = run_cycle(engine=engine, notifier=notifier, config=config)
+            if cycle_result.success:
+                engine.state.save_to_file(config.state_file)
+                weekly_digest_state = update_weekly_digest_state(
+                    weekly_digest_state,
+                    market_df=cycle_result.market_df,
+                    alerts=cycle_result.alerts,
+                    portfolio_drop_pct=cycle_result.portfolio_drop_pct,
+                    timezone_name=config.weekly_summary_timezone,
+                )
+                weekly_digest_state.save_to_file(config.weekly_summary_state_file)
+                _run_weekly_digest_if_due(
+                    config=config,
+                    notifier=notifier,
+                    weekly_digest_state=weekly_digest_state,
+                    market_df=cycle_result.market_df,
+                    portfolio_value=config.portfolio_value,
+                    portfolio_drop_pct=cycle_result.portfolio_drop_pct,
+                )
+            else:
+                write_heartbeat(config.heartbeat_file, success=False)
+        except Exception:
+            logger.exception("Worker cycle failed unexpectedly.")
+            write_heartbeat(config.heartbeat_file, success=False)
+
+        if config.run_once:
+            logger.info("Run-once mode enabled. Exiting after one cycle.")
+            break
+
+        sleep_with_logging(
+            stop_event=stop_event,
+            seconds=config.interval_seconds,
+            jitter_seconds=config.sleep_jitter_seconds,
+        )
+
+    logger.info("Worker stopped cleanly.")
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments for worker entrypoint."""
+    parser = argparse.ArgumentParser(description="Run background alert worker.")
+    parser.add_argument("--run-once", action="store_true", help="Run a single cycle and exit.")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    worker_config = load_worker_config_from_env()
+    if args.run_once:
+        worker_config = WorkerConfig(
+            interval_seconds=worker_config.interval_seconds,
+            log_level=worker_config.log_level,
+            run_once=True,
+            dry_run=worker_config.dry_run,
+            lookback_period=worker_config.lookback_period,
+            portfolio_value=worker_config.portfolio_value,
+            heartbeat_file=worker_config.heartbeat_file,
+            state_file=worker_config.state_file,
+            sleep_jitter_seconds=worker_config.sleep_jitter_seconds,
+            fetch_retry_delay_seconds=worker_config.fetch_retry_delay_seconds,
+            weekly_summary_enabled=worker_config.weekly_summary_enabled,
+            weekly_summary_channel=worker_config.weekly_summary_channel,
+            weekly_summary_day=worker_config.weekly_summary_day,
+            weekly_summary_hour=worker_config.weekly_summary_hour,
+            weekly_summary_timezone=worker_config.weekly_summary_timezone,
+            weekly_summary_email_to=worker_config.weekly_summary_email_to,
+            weekly_summary_state_file=worker_config.weekly_summary_state_file,
+        )
+
+    configure_logging(worker_config.log_level)
+    alert_settings = load_alert_settings_from_env()
+    logger.info(
+        "Effective startup config: alert_channel=%s weekly_summary_enabled=%s weekly_summary_channel=%s email_to_set=%s telegram_chat_id_set=%s",
+        alert_settings.channel,
+        worker_config.weekly_summary_enabled,
+        worker_config.weekly_summary_channel,
+        bool(alert_settings.email_to),
+        bool(alert_settings.telegram_chat_id),
+    )
+    run_worker(config=worker_config, alert_settings=alert_settings)
+
+
+def _calculate_portfolio_drop_pct(engine: AlertEngine, portfolio_value: Optional[float]) -> Optional[float]:
+    if portfolio_value is None:
+        return None
+    peak = engine.state.get_metric("portfolio_peak_value")
+    if peak in (None, 0):
+        return None
+    return ((portfolio_value - peak) / peak) * 100.0
+
+
+def _run_weekly_digest_if_due(
+    *,
+    config: WorkerConfig,
+    notifier: AlertNotifier,
+    weekly_digest_state: WeeklyDigestState,
+    market_df,
+    portfolio_value: Optional[float],
+    portfolio_drop_pct: Optional[float],
+) -> None:
+    if config.weekly_summary_channel == "none":
+        logger.info("Weekly digest skipped due to weekly channel setting: channel=none")
+        return
+
+    if not should_send_weekly_digest(
+        weekly_digest_state,
+        enabled=config.weekly_summary_enabled,
+        day=config.weekly_summary_day,
+        hour=config.weekly_summary_hour,
+        timezone_name=config.weekly_summary_timezone,
+    ):
+        logger.info("Weekly digest skipped (not due).")
+        return
+    logger.info("Weekly digest due for current schedule.")
+
+    recipient = config.weekly_summary_email_to or notifier.settings.email_to
+    if not recipient:
+        logger.warning("Weekly digest due but no recipient configured.")
+        return
+
+    subject = "Weekly Investment System Digest"
+    body = build_weekly_digest_text(
+        state=weekly_digest_state,
+        market_df=market_df,
+        portfolio_value=portfolio_value,
+        portfolio_drop_pct=portfolio_drop_pct,
+    )
+
+    sent = notifier.send_weekly_summary_email(subject=subject, body=body, recipient=recipient)
+    if not sent:
+        logger.warning("Weekly digest send failed.")
+        return
+
+    mark_weekly_digest_sent(
+        weekly_digest_state,
+        timezone_name=config.weekly_summary_timezone,
+    )
+    weekly_digest_state.save_to_file(config.weekly_summary_state_file)
+    logger.info("Weekly digest sent successfully to %s", recipient)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,36 @@
+{
+  "current_week_key": "2026-W15",
+  "last_sent_week_key": "2026-W15",
+  "last_sent_timestamp": "2026-04-07T22:58:59.900531+02:00",
+  "alert_counts": {
+    "market_drawdown": 12,
+    "portfolio_drop": 0,
+    "vix_spike": 1
+  },
+  "max_drawdown_by_symbol": {
+    "VWCE": -4.600293260856614,
+    "CNDX": -8.108525239219961,
+    "SPY": -5.21503113495958,
+    "QQQ": -7.4209212807119815,
+    "VIX": -50.73571606231697,
+    "DXY": -3.47763252341517,
+    "TNX": -5.504792182111946
+  },
+  "max_vix": 25.780000686645508,
+  "portfolio_drop_occurred": false,
+  "notable_events": [
+    "VWCE drawdown reached -4.60% (threshold -3%).",
+    "VWCE drawdown reached -4.60% (threshold -2%).",
+    "VWCE drawdown reached -4.60% (threshold -1%).",
+    "CNDX drawdown reached -8.11% (threshold -3%).",
+    "CNDX drawdown reached -8.11% (threshold -2%).",
+    "CNDX drawdown reached -8.11% (threshold -1%).",
+    "SPY drawdown reached -5.22% (threshold -3%).",
+    "SPY drawdown reached -5.22% (threshold -2%).",
+    "SPY drawdown reached -5.22% (threshold -1%).",
+    "QQQ drawdown reached -7.42% (threshold -3%).",
+    "QQQ drawdown reached -7.42% (threshold -2%).",
+    "QQQ drawdown reached -7.42% (threshold -1%).",
+    "VIX spiked to 25.78 (threshold 25.00)."
+  ]
+}
