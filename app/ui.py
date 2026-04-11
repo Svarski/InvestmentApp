@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -28,6 +31,86 @@ from services.market_data import (
 )
 
 logger = logging.getLogger(__name__)
+
+WORKER_HEARTBEAT_MAX_AGE_SEC = 300
+
+
+def _parse_last_success_timestamp_utc(value: object) -> Optional[datetime]:
+    """Parse worker heartbeat ``last_success_timestamp`` (ISO) to aware UTC datetime."""
+    if not value or not isinstance(value, str):
+        return None
+    s = value.strip()
+    if not s:
+        return None
+    try:
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _heartbeat_success_is_stale(raw: dict) -> bool:
+    """True if last_success_timestamp is missing, invalid, or older than WORKER_HEARTBEAT_MAX_AGE_SEC."""
+    parsed = _parse_last_success_timestamp_utc(raw.get("last_success_timestamp"))
+    if parsed is None:
+        return True
+    age_sec = (datetime.now(timezone.utc) - parsed).total_seconds()
+    return age_sec > WORKER_HEARTBEAT_MAX_AGE_SEC
+
+
+def _read_worker_heartbeat_state() -> Tuple[bool, str, Optional[str]]:
+    """Returns (worker_heartbeat_stale, portfolio_source, last_ibkr_caption).
+
+    If WORKER_HEARTBEAT_FILE is unset, heartbeat is not treated as stale (unknown).
+    """
+    path = (os.getenv("WORKER_HEARTBEAT_FILE") or "").strip()
+    if not path:
+        return False, "Fallback", None
+    if not os.path.isfile(path):
+        return True, "Fallback", None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception:
+        return True, "Fallback", None
+    if not isinstance(raw, dict):
+        return True, "Fallback", None
+
+    heartbeat_stale = _heartbeat_success_is_stale(raw)
+
+    src = raw.get("portfolio_source") or "Fallback"
+    if src not in ("IBKR", "IBKR_STALE", "Fallback"):
+        src = "Fallback"
+
+    last_ibkr_line: Optional[str] = None
+    ts = raw.get("portfolio_ibkr_timestamp")
+    if ts is not None and src in ("IBKR", "IBKR_STALE"):
+        try:
+            dt = datetime.fromtimestamp(float(ts), tz=timezone.utc)
+            last_ibkr_line = dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+        except (TypeError, ValueError, OSError):
+            last_ibkr_line = None
+
+    return heartbeat_stale, src, last_ibkr_line
+
+
+def _render_portfolio_source_indicator() -> None:
+    """Worker portfolio source and heartbeat freshness (last successful worker cycle)."""
+    heartbeat_stale, src, last_ibkr = _read_worker_heartbeat_state()
+    if heartbeat_stale:
+        st.error("Worker not running or heartbeat stale")
+    if src == "IBKR":
+        st.success("Portfolio source: IBKR")
+    elif src == "IBKR_STALE":
+        st.warning("Portfolio source: IBKR (stale)")
+    else:
+        st.error("Portfolio source: Fallback")
+    if last_ibkr:
+        st.caption(f"Last IBKR update: {last_ibkr}")
 
 
 def _get_alert_engine() -> AlertEngine:
@@ -273,6 +356,7 @@ def render_portfolio_performance_section() -> None:
     """Show persisted portfolio history from SQLite (worker) with value and growth charts."""
     st.divider()
     st.subheader("📈 Portfolio Performance")
+    _render_portfolio_source_indicator()
     days = st.selectbox("Period", [7, 30, 90], index=1, key="portfolio_performance_period")
 
     df = get_portfolio_history(days=days)

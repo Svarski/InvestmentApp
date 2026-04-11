@@ -31,6 +31,7 @@ from services.reports.weekly_digest import (
     should_send_weekly_digest,
     update_weekly_digest_state,
 )
+from services.ibkr_client import IBKRClient
 from services.market_data import build_market_overview, fetch_history_for_ticker_uncached
 
 logger = logging.getLogger("investment_worker")
@@ -66,6 +67,22 @@ class CycleResult:
     alerts: List[object]
     market_df: object
     portfolio_drop_pct: Optional[float]
+    portfolio_value: Optional[float]
+    portfolio_source: str = "Fallback"
+
+
+IBKR_PORTFOLIO_MAX_AGE_SEC = 120.0
+
+
+def _ibkr_payload_timestamp(data: dict) -> Optional[float]:
+    """Epoch seconds from IBKR payload, or None if missing/invalid."""
+    ts = data.get("timestamp")
+    if ts is None:
+        return None
+    try:
+        return float(ts)
+    except (TypeError, ValueError):
+        return None
 
 
 def _parse_bool(value: Optional[str], default: bool = False) -> bool:
@@ -221,26 +238,41 @@ def _persist_alerts_to_db(alerts: List[Alert]) -> None:
             logger.error("DB insert failed: %s", e)
 
 
-def write_heartbeat(path: Optional[str], *, success: bool) -> None:
-    """Write heartbeat JSON with last success/failure timestamps."""
+def write_heartbeat(
+    path: Optional[str],
+    *,
+    success: bool,
+    portfolio_source: Optional[str] = None,
+    portfolio_ibkr_timestamp: Optional[float] = None,
+) -> None:
+    """Write heartbeat JSON with last success/failure timestamps and optional portfolio source."""
     if not path:
         return
     try:
         timestamp = datetime.now(timezone.utc).isoformat()
-        payload = {"last_success_timestamp": None, "last_failure_timestamp": None}
+        payload: dict = {
+            "last_success_timestamp": None,
+            "last_failure_timestamp": None,
+            "portfolio_source": "Fallback",
+            "portfolio_ibkr_timestamp": None,
+        }
 
         if os.path.exists(path):
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     existing = json.load(f)
                 if isinstance(existing, dict):
-                    payload["last_success_timestamp"] = existing.get("last_success_timestamp")
-                    payload["last_failure_timestamp"] = existing.get("last_failure_timestamp")
+                    for key in payload:
+                        if key in existing:
+                            payload[key] = existing[key]
             except Exception:
                 logger.warning("Heartbeat file exists but could not be read. path=%s", path)
 
         if success:
             payload["last_success_timestamp"] = timestamp
+            if portfolio_source is not None:
+                payload["portfolio_source"] = portfolio_source
+                payload["portfolio_ibkr_timestamp"] = portfolio_ibkr_timestamp
         else:
             payload["last_failure_timestamp"] = timestamp
 
@@ -250,7 +282,12 @@ def write_heartbeat(path: Optional[str], *, success: bool) -> None:
         logger.exception("Failed to write heartbeat file path=%s", path)
 
 
-def run_cycle(engine: AlertEngine, notifier: AlertNotifier, config: WorkerConfig) -> CycleResult:
+def run_cycle(
+    engine: AlertEngine,
+    notifier: AlertNotifier,
+    config: WorkerConfig,
+    ibkr_client: IBKRClient,
+) -> CycleResult:
     """Run one worker cycle safely: fetch, evaluate, notify, log."""
     logger.info("Cycle started.")
 
@@ -280,13 +317,57 @@ def run_cycle(engine: AlertEngine, notifier: AlertNotifier, config: WorkerConfig
 
     if market_df.empty:
         logger.warning("Market dataframe is empty. Skipping alert evaluation for this cycle.")
-        return CycleResult(success=False, alerts=[], market_df=market_df, portfolio_drop_pct=None)
+        return CycleResult(
+            success=False,
+            alerts=[],
+            market_df=market_df,
+            portfolio_drop_pct=None,
+            portfolio_value=None,
+            portfolio_source="Fallback",
+        )
 
-    if config.portfolio_value is None:
+    try:
+        ibkr_data = ibkr_client.get_portfolio()
+    except Exception:
+        ibkr_data = None
+
+    portfolio_value: Optional[float]
+    portfolio_source: str
+    portfolio_ibkr_timestamp: Optional[float] = None
+
+    if ibkr_data is None:
+        portfolio_value = config.portfolio_value
+        portfolio_source = "Fallback"
+    else:
+        ts_f = _ibkr_payload_timestamp(ibkr_data)
+        if ts_f is None:
+            portfolio_value = config.portfolio_value
+            portfolio_source = "Fallback"
+        elif (time.time() - ts_f) > IBKR_PORTFOLIO_MAX_AGE_SEC:
+            portfolio_value = config.portfolio_value
+            portfolio_source = "IBKR_STALE"
+            portfolio_ibkr_timestamp = ts_f
+        else:
+            try:
+                portfolio_value = float(ibkr_data["total_value"])
+                portfolio_source = "IBKR"
+                portfolio_ibkr_timestamp = ts_f
+            except (KeyError, TypeError, ValueError):
+                portfolio_value = config.portfolio_value
+                portfolio_source = "Fallback"
+
+    if portfolio_source == "IBKR":
+        logger.info("Portfolio source: IBKR")
+    elif portfolio_source == "IBKR_STALE":
+        logger.info("Portfolio source: IBKR (stale)")
+    else:
+        logger.info("Portfolio source: fallback")
+
+    if portfolio_value is None:
         logger.info("Portfolio value not configured for worker; portfolio drop alerts may not trigger.")
 
-    alerts = engine.evaluate(market_df=market_df, portfolio_value=config.portfolio_value)
-    portfolio_drop_pct = _calculate_portfolio_drop_pct(engine=engine, portfolio_value=config.portfolio_value)
+    alerts = engine.evaluate(market_df=market_df, portfolio_value=portfolio_value)
+    portfolio_drop_pct = _calculate_portfolio_drop_pct(engine=engine, portfolio_value=portfolio_value)
     breakdown = {"drawdown": 0, "portfolio": 0, "vix": 0, "other": 0}
     for alert in alerts:
         if alert.type == "market_drawdown":
@@ -307,8 +388,20 @@ def run_cycle(engine: AlertEngine, notifier: AlertNotifier, config: WorkerConfig
     _persist_alerts_to_db(alerts)
 
     if not alerts:
-        write_heartbeat(config.heartbeat_file, success=True)
-        return CycleResult(success=True, alerts=[], market_df=market_df, portfolio_drop_pct=portfolio_drop_pct)
+        write_heartbeat(
+            config.heartbeat_file,
+            success=True,
+            portfolio_source=portfolio_source,
+            portfolio_ibkr_timestamp=portfolio_ibkr_timestamp,
+        )
+        return CycleResult(
+            success=True,
+            alerts=[],
+            market_df=market_df,
+            portfolio_drop_pct=portfolio_drop_pct,
+            portfolio_value=portfolio_value,
+            portfolio_source=portfolio_source,
+        )
 
     if config.dry_run:
         logger.info("Dry run enabled. Skipping notification send for %s alerts.", len(alerts))
@@ -318,8 +411,20 @@ def run_cycle(engine: AlertEngine, notifier: AlertNotifier, config: WorkerConfig
             0,
             len(alerts),
         )
-        write_heartbeat(config.heartbeat_file, success=True)
-        return CycleResult(success=True, alerts=alerts, market_df=market_df, portfolio_drop_pct=portfolio_drop_pct)
+        write_heartbeat(
+            config.heartbeat_file,
+            success=True,
+            portfolio_source=portfolio_source,
+            portfolio_ibkr_timestamp=portfolio_ibkr_timestamp,
+        )
+        return CycleResult(
+            success=True,
+            alerts=alerts,
+            market_df=market_df,
+            portfolio_drop_pct=portfolio_drop_pct,
+            portfolio_value=portfolio_value,
+            portfolio_source=portfolio_source,
+        )
 
     stats = notifier.send_alerts_with_stats(alerts)
     failed_alerts = max(0, stats.attempted_alerts - stats.sent_alerts)
@@ -329,8 +434,20 @@ def run_cycle(engine: AlertEngine, notifier: AlertNotifier, config: WorkerConfig
         stats.sent_alerts,
         failed_alerts,
     )
-    write_heartbeat(config.heartbeat_file, success=True)
-    return CycleResult(success=True, alerts=alerts, market_df=market_df, portfolio_drop_pct=portfolio_drop_pct)
+    write_heartbeat(
+        config.heartbeat_file,
+        success=True,
+        portfolio_source=portfolio_source,
+        portfolio_ibkr_timestamp=portfolio_ibkr_timestamp,
+    )
+    return CycleResult(
+        success=True,
+        alerts=alerts,
+        market_df=market_df,
+        portfolio_drop_pct=portfolio_drop_pct,
+        portfolio_value=portfolio_value,
+        portfolio_source=portfolio_source,
+    )
 
 
 def sleep_with_logging(stop_event: threading.Event, seconds: int, jitter_seconds: int) -> None:
@@ -386,56 +503,71 @@ def run_worker(config: WorkerConfig, alert_settings: AlertSettings) -> None:
     except Exception as e:
         logger.error("DB init failed: %s", e)
 
-    while not stop_event.is_set():
-        logger.info("Beginning worker cycle.")
-        try:
-            cycle_result = run_cycle(engine=engine, notifier=notifier, config=config)
-            if cycle_result.success:
-                engine.state.save_to_file(config.state_file)
-                weekly_digest_state = update_weekly_digest_state(
-                    weekly_digest_state,
-                    market_df=cycle_result.market_df,
-                    alerts=cycle_result.alerts,
-                    portfolio_drop_pct=cycle_result.portfolio_drop_pct,
-                    timezone_name=config.weekly_summary_timezone,
-                )
-                weekly_digest_state.save_to_file(config.weekly_summary_state_file)
-                _run_weekly_digest_if_due(
-                    config=config,
-                    notifier=notifier,
-                    weekly_digest_state=weekly_digest_state,
-                    market_df=cycle_result.market_df,
-                    portfolio_value=config.portfolio_value,
-                    portfolio_drop_pct=cycle_result.portfolio_drop_pct,
-                )
-            else:
-                write_heartbeat(config.heartbeat_file, success=False)
-        except Exception:
-            logger.exception("Worker cycle failed unexpectedly.")
-            write_heartbeat(config.heartbeat_file, success=False)
-        finally:
+    ibkr_client = IBKRClient()
+    try:
+        while not stop_event.is_set():
+            logger.info("Beginning worker cycle.")
+            cycle_result: Optional[CycleResult] = None
             try:
-                ts = datetime.now(timezone.utc).isoformat()
-                total = float(config.portfolio_value) if config.portfolio_value is not None else 0.0
-                db.insert_portfolio_snapshot(
-                    timestamp=ts,
-                    total_value=total,
-                    vwce_value=0.0,
-                    cndx_value=0.0,
-                    cash=0.0,
+                cycle_result = run_cycle(
+                    engine=engine,
+                    notifier=notifier,
+                    config=config,
+                    ibkr_client=ibkr_client,
                 )
-            except Exception as e:
-                logger.error("DB insert failed: %s", e)
+                if cycle_result.success:
+                    engine.state.save_to_file(config.state_file)
+                    weekly_digest_state = update_weekly_digest_state(
+                        weekly_digest_state,
+                        market_df=cycle_result.market_df,
+                        alerts=cycle_result.alerts,
+                        portfolio_drop_pct=cycle_result.portfolio_drop_pct,
+                        timezone_name=config.weekly_summary_timezone,
+                    )
+                    weekly_digest_state.save_to_file(config.weekly_summary_state_file)
+                    _run_weekly_digest_if_due(
+                        config=config,
+                        notifier=notifier,
+                        weekly_digest_state=weekly_digest_state,
+                        market_df=cycle_result.market_df,
+                        portfolio_value=cycle_result.portfolio_value
+                        if cycle_result.portfolio_value is not None
+                        else config.portfolio_value,
+                        portfolio_drop_pct=cycle_result.portfolio_drop_pct,
+                    )
+                else:
+                    write_heartbeat(config.heartbeat_file, success=False)
+            except Exception:
+                logger.exception("Worker cycle failed unexpectedly.")
+                write_heartbeat(config.heartbeat_file, success=False)
+            finally:
+                try:
+                    ts = datetime.now(timezone.utc).isoformat()
+                    pv = config.portfolio_value
+                    if cycle_result is not None and cycle_result.portfolio_value is not None:
+                        pv = cycle_result.portfolio_value
+                    total = float(pv) if pv is not None else 0.0
+                    db.insert_portfolio_snapshot(
+                        timestamp=ts,
+                        total_value=total,
+                        vwce_value=0.0,
+                        cndx_value=0.0,
+                        cash=0.0,
+                    )
+                except Exception as e:
+                    logger.error("DB insert failed: %s", e)
 
-        if config.run_once:
-            logger.info("Run-once mode enabled. Exiting after one cycle.")
-            break
+            if config.run_once:
+                logger.info("Run-once mode enabled. Exiting after one cycle.")
+                break
 
-        sleep_with_logging(
-            stop_event=stop_event,
-            seconds=config.interval_seconds,
-            jitter_seconds=config.sleep_jitter_seconds,
-        )
+            sleep_with_logging(
+                stop_event=stop_event,
+                seconds=config.interval_seconds,
+                jitter_seconds=config.sleep_jitter_seconds,
+            )
+    finally:
+        ibkr_client.disconnect()
 
     logger.info("Worker stopped cleanly.")
 

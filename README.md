@@ -1,5 +1,18 @@
 # Personal Investment Dashboard MVP
 
+--Nova verzija:
+--comp
+git add .
+git commit -m "update"
+git push
+
+--server
+ssh root@178.104.129.99
+cd ~/investmentapp
+git pull
+docker-compose down
+docker-compose up -d --build
+
 Simple Streamlit MVP for tracking core market instruments and a manually entered portfolio.
 
 ## Features

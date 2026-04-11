@@ -29,9 +29,7 @@
       ]
     },
     "vix_spike": {
-      "triggered_levels": [
-        25.0
-      ]
+      "triggered_levels": []
     }
   },
   "metrics": {}
