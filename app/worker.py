@@ -15,12 +15,15 @@ import signal
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 from alerts import AlertEngine, AlertNotifier, AlertSettings, AlertState
+from alerts.models import Alert
 from alerts.settings_loader import get_alert_settings
 from config import DEFAULT_LOOKBACK_PERIOD
+import db
+from buying_ladder.weekly_appendix import build_buying_ladder_weekly_appendix
 from services.reports.weekly_digest import (
     WeeklyDigestState,
     build_weekly_digest_text,
@@ -142,6 +145,82 @@ def configure_logging(log_level: str) -> None:
     )
 
 
+def _symbol_and_level_from_alert_id(alert_id: str) -> tuple[str, float]:
+    """Derive DB symbol and numeric level from engine alert id ``{key}:{level:.2f}``."""
+    try:
+        if not alert_id or ":" not in alert_id:
+            return "UNKNOWN", 0.0
+        key, level_s = alert_id.rsplit(":", 1)
+        level = float(level_s)
+        if key.endswith("_drawdown"):
+            symbol = key[: -len("_drawdown")] or "UNKNOWN"
+        elif key == "portfolio_drop":
+            symbol = "PORTFOLIO"
+        elif key == "vix_spike":
+            symbol = "VIX"
+        else:
+            symbol = key if key else "UNKNOWN"
+        return symbol, level
+    except (TypeError, ValueError, AttributeError):
+        return "UNKNOWN", 0.0
+
+
+def _symbol_and_level_for_db(alert: Alert) -> tuple[str, float]:
+    """Prefer structured fields on ``Alert`` when present; otherwise parse ``alert.id``."""
+    sym = getattr(alert, "symbol", None)
+    lev = getattr(alert, "level", None)
+    if isinstance(sym, str) and sym.strip() and lev is not None:
+        try:
+            return sym.strip(), float(lev)
+        except (TypeError, ValueError):
+            pass
+    return _symbol_and_level_from_alert_id(alert.id)
+
+
+def _is_recent_duplicate_alert(symbol: str, alert_type: str, level: float) -> bool:
+    """True if an equivalent row exists in the last 5 minutes (UTC)."""
+    conn = None
+    try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        conn = db.get_connection()
+        row = conn.execute(
+            """
+            SELECT 1 FROM alerts
+            WHERE symbol = ?
+              AND type = ?
+              AND level = ?
+              AND timestamp >= ?
+            LIMIT 1
+            """,
+            (symbol, alert_type, level, cutoff),
+        ).fetchone()
+        return row is not None
+    except Exception:
+        return False
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _persist_alerts_to_db(alerts: List[Alert]) -> None:
+    for alert in alerts:
+        try:
+            symbol, level = _symbol_and_level_for_db(alert)
+            if _is_recent_duplicate_alert(symbol, alert.type, level):
+                logger.debug("Skipping duplicate alert DB insert")
+                continue
+            ts = datetime.now(timezone.utc).isoformat()
+            db.insert_alert(
+                timestamp=ts,
+                symbol=symbol,
+                alert_type=alert.type,
+                level=level,
+                message=alert.message,
+            )
+        except Exception as e:
+            logger.error("DB insert failed: %s", e)
+
+
 def write_heartbeat(path: Optional[str], *, success: bool) -> None:
     """Write heartbeat JSON with last success/failure timestamps."""
     if not path:
@@ -225,6 +304,8 @@ def run_cycle(engine: AlertEngine, notifier: AlertNotifier, config: WorkerConfig
         breakdown,
     )
 
+    _persist_alerts_to_db(alerts)
+
     if not alerts:
         write_heartbeat(config.heartbeat_file, success=True)
         return CycleResult(success=True, alerts=[], market_df=market_df, portfolio_drop_pct=portfolio_drop_pct)
@@ -300,6 +381,11 @@ def run_worker(config: WorkerConfig, alert_settings: AlertSettings) -> None:
         config.weekly_summary_state_file,
     )
 
+    try:
+        db.init_db()
+    except Exception as e:
+        logger.error("DB init failed: %s", e)
+
     while not stop_event.is_set():
         logger.info("Beginning worker cycle.")
         try:
@@ -327,6 +413,19 @@ def run_worker(config: WorkerConfig, alert_settings: AlertSettings) -> None:
         except Exception:
             logger.exception("Worker cycle failed unexpectedly.")
             write_heartbeat(config.heartbeat_file, success=False)
+        finally:
+            try:
+                ts = datetime.now(timezone.utc).isoformat()
+                total = float(config.portfolio_value) if config.portfolio_value is not None else 0.0
+                db.insert_portfolio_snapshot(
+                    timestamp=ts,
+                    total_value=total,
+                    vwce_value=0.0,
+                    cndx_value=0.0,
+                    cash=0.0,
+                )
+            except Exception as e:
+                logger.error("DB insert failed: %s", e)
 
         if config.run_once:
             logger.info("Run-once mode enabled. Exiting after one cycle.")
@@ -424,11 +523,15 @@ def _run_weekly_digest_if_due(
         return
 
     subject = "Weekly Investment System Digest"
+    bl_appendix, bl_reason = build_buying_ladder_weekly_appendix(market_df)
+    logger.info("Weekly buying ladder appendix: reason=%s has_body=%s", bl_reason, bool(bl_appendix))
+
     body = build_weekly_digest_text(
         state=weekly_digest_state,
         market_df=market_df,
         portfolio_value=portfolio_value,
         portfolio_drop_pct=portfolio_drop_pct,
+        buying_ladder_appendix=bl_appendix,
     )
 
     sent = notifier.send_weekly_summary_email(subject=subject, body=body, recipient=recipient)

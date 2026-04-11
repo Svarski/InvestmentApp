@@ -1,0 +1,63 @@
+{
+  "enabled": true,
+  "benchmark_symbol": "VWCE",
+  "phase_selection_mode": "elapsed",
+  "plan_start_date": "2026-05-01",
+  "manual_phase_index": 0,
+  "phases": [
+    {
+      "label": "Years 1\u20135",
+      "year_start": 1,
+      "year_end": 5,
+      "monthly_amount": 350.0
+    },
+    {
+      "label": "Years 6\u201310",
+      "year_start": 6,
+      "year_end": 10,
+      "monthly_amount": 550.0
+    },
+    {
+      "label": "Years 11\u201320",
+      "year_start": 11,
+      "year_end": 20,
+      "monthly_amount": 700.0
+    }
+  ],
+  "ladder_steps": [
+    {
+      "drawdown_threshold_pct": 0.0,
+      "multiplier": 1.0,
+      "label": "Normal"
+    },
+    {
+      "drawdown_threshold_pct": -10.0,
+      "multiplier": 1.25,
+      "label": "Pullback"
+    },
+    {
+      "drawdown_threshold_pct": -20.0,
+      "multiplier": 1.6,
+      "label": "Correction"
+    },
+    {
+      "drawdown_threshold_pct": -30.0,
+      "multiplier": 2.0,
+      "label": "Deep Correction"
+    },
+    {
+      "drawdown_threshold_pct": -40.0,
+      "multiplier": 2.75,
+      "label": "Crash"
+    },
+    {
+      "drawdown_threshold_pct": -50.0,
+      "multiplier": 3.25,
+      "label": "Extreme Crash"
+    }
+  ],
+  "show_calculation_details": true,
+  "crash_extra_equity_pct": null,
+  "include_buying_ladder_in_weekly_summary": true,
+  "suggest_vwce_cndx_split": true
+}

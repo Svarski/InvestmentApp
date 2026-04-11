@@ -4,7 +4,7 @@ Simple Streamlit MVP for tracking core market instruments and a manually entered
 
 ## Features
 
-- Market overview for `VWCE`, `CNDX`, `SPY`, `QQQ`, `VIX`, `DXY`, `TNX`
+- Market overview for `VWCE`, `CNDX`, `SPY`, `VIX`, `DXY`, `TNX`
 - Latest price, daily % change, and drawdown from all-time high
 - Manual portfolio input (ticker, quantity, average buy price)
 - Portfolio calculations: current value, cost basis, unrealized PnL, unrealized PnL %

@@ -7,7 +7,6 @@ TRACKED_INSTRUMENTS = {
     "VWCE": {"ticker": "VWCE.DE", "name": "Vanguard FTSE All-World UCITS ETF"},
     "CNDX": {"ticker": "CNDX.AS", "name": "iShares Nasdaq 100 UCITS ETF"},
     "SPY": {"ticker": "SPY", "name": "SPDR S&P 500 ETF Trust"},
-    "QQQ": {"ticker": "QQQ", "name": "Invesco QQQ Trust"},
     "VIX": {"ticker": "^VIX", "name": "CBOE Volatility Index"},
     "DXY": {"ticker": "DX-Y.NYB", "name": "US Dollar Index"},
     "TNX": {"ticker": "^TNX", "name": "US 10-Year Treasury Yield"},

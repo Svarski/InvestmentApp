@@ -10,9 +10,11 @@ from typing import Optional, Tuple
 class AlertSettings:
     """Thresholds, channels, and delivery settings for alerts."""
 
+    channel: str = "none"
+
     # Rule thresholds
     drawdown_levels: Tuple[float, ...] = (-5.0, -10.0, -20.0, -30.0, -40.0, -50.0)
-    drawdown_alert_symbols: Tuple[str, ...] = ("VWCE", "CNDX", "SPY", "QQQ")
+    drawdown_alert_symbols: Tuple[str, ...] = ("VWCE", "CNDX", "SPY")
     portfolio_drop_levels: Tuple[float, ...] = (-5.0, -10.0, -20.0)
     vix_spike_threshold: float = 30.0
 

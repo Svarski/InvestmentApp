@@ -11,7 +11,9 @@ import streamlit as st
 
 from alerts import AlertEngine, get_alert_settings
 from app.components import format_percent, format_price, render_info_banner, render_warning_messages
+from buying_ladder.ui import render_buying_ladder_card, render_buying_ladder_sidebar
 from config import CHART_PERIOD_OPTIONS, DEFAULT_CHART_PERIOD, DEFAULT_LOOKBACK_PERIOD, TRACKED_INSTRUMENTS
+from db import get_portfolio_history, get_recent_alerts
 from logic.calculations import (
     calculate_cost_basis,
     calculate_market_value,
@@ -130,7 +132,7 @@ def render_market_overview() -> pd.DataFrame:
 
     st.dataframe(
         display_df[["Symbol", "Name", "Ticker", "Price", "Daily Change %", "Drawdown from ATH %"]],
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         column_config={
             "Price": st.column_config.NumberColumn("Price", format="%.2f"),
@@ -153,7 +155,7 @@ def _portfolio_input_table(default_rows: int = 3) -> pd.DataFrame:
     return st.data_editor(
         initial_df,
         num_rows="dynamic",
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         column_config={
             "Ticker": st.column_config.TextColumn("Ticker", help="Example: SPY"),
@@ -237,7 +239,7 @@ def render_portfolio_section() -> Optional[float]:
     result_df = pd.DataFrame(portfolio_rows)
     st.dataframe(
         result_df,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         column_config={
             "Quantity": st.column_config.NumberColumn("Quantity", format="%.4f"),
@@ -267,6 +269,99 @@ def render_portfolio_section() -> Optional[float]:
     return total_current_value
 
 
+def render_portfolio_performance_section() -> None:
+    """Show persisted portfolio history from SQLite (worker) with value and growth charts."""
+    st.divider()
+    st.subheader("📈 Portfolio Performance")
+    days = st.selectbox("Period", [7, 30, 90], index=1, key="portfolio_performance_period")
+
+    df = get_portfolio_history(days=days)
+    if df.empty:
+        st.info("No portfolio data yet")
+        return
+
+    df = df.copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    df["total_value"] = pd.to_numeric(df["total_value"], errors="coerce")
+    for col in ("vwce_value", "cndx_value", "cash"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.dropna(subset=["timestamp", "total_value"])
+    if df.empty:
+        st.info("No portfolio data yet")
+        return
+
+    df = df.sort_values("timestamp")
+    if len(df) == 1:
+        df["growth_pct"] = 0.0
+    else:
+        baseline = df["total_value"].iloc[0]
+        if pd.isna(baseline) or baseline == 0:
+            df["growth_pct"] = 0.0
+        else:
+            df["growth_pct"] = (df["total_value"] / baseline - 1) * 100
+
+    df = df.set_index("timestamp")
+    chart_df = df[["total_value", "growth_pct"]].dropna(how="any")
+    if chart_df.empty:
+        st.info("No portfolio data yet")
+        return
+
+    last_value = float(chart_df["total_value"].iloc[-1])
+    last_growth = float(chart_df["growth_pct"].iloc[-1])
+
+    col1, col2 = st.columns(2)
+    col1.metric("Portfolio Value", f"{last_value:,.0f} €".replace(",", " "))
+    col2.metric("Growth", f"{last_growth:.2f} %", delta=last_growth)
+
+    st.markdown("")
+
+    if len(chart_df) < 2:
+        st.warning("Not enough data for meaningful chart")
+        return
+
+    with st.container():
+        st.caption("Portfolio value over time (€)")
+        st.line_chart(chart_df[["total_value"]])
+        st.caption("Growth (%)")
+        st.line_chart(chart_df[["growth_pct"]])
+
+
+def render_alert_history_section() -> None:
+    """Show recent alerts persisted in SQLite (worker)."""
+    st.divider()
+    st.subheader("🚨 Alert History")
+
+    df = get_recent_alerts(limit=20)
+    if df.empty:
+        st.info("No alerts yet")
+        return
+
+    df = df.copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    df = df.dropna(subset=["timestamp"])
+    if df.empty:
+        st.info("No valid alerts to display")
+        return
+    df = df.sort_values("timestamp", ascending=False, na_position="last")
+    df["timestamp"] = df["timestamp"].dt.strftime("%Y-%m-%d %H:%M")
+
+    df = df[["timestamp", "symbol", "type", "level", "message"]]
+    df.columns = ["Time", "Symbol", "Type", "Level", "Message"]
+
+    df["Level"] = pd.to_numeric(df["Level"], errors="coerce")
+    df["Level"] = df["Level"].map(lambda x: f"{float(x):.2f}" if pd.notna(x) else "—")
+    df["Symbol"] = df["Symbol"].astype(str).str.upper()
+    df["Type"] = df["Type"].astype(str).str.replace("_", " ", regex=False).str.title()
+
+    _msg = df["Message"].astype(str)
+    df["Message"] = _msg.where(_msg.str.len() <= 80, _msg.str.slice(0, 77) + "...")
+
+    st.caption("Latest alerts (most recent first)")
+    st.dataframe(df, width="stretch", hide_index=True, height=300)
+
+
 def render_chart_section() -> None:
     """Render instrument price chart with selectable time range."""
     st.subheader("Price Chart")
@@ -294,15 +389,19 @@ def render_chart_section() -> None:
         labels={"Close": "Price", "Date": "Date"},
     )
     fig.update_layout(margin={"l": 10, "r": 10, "t": 50, "b": 10}, height=420)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 
 def render_dashboard() -> None:
     """Render the complete dashboard page."""
+    render_buying_ladder_sidebar()
     render_header()
     market_df = render_market_overview()
+    render_buying_ladder_card(market_df)
     st.divider()
     portfolio_total_value = render_portfolio_section()
+    render_portfolio_performance_section()
+    render_alert_history_section()
     _evaluate_alerts_safely(market_df=market_df, portfolio_value=portfolio_total_value)
     st.divider()
     render_alerts_section()

@@ -179,6 +179,7 @@ def build_weekly_digest_text(
     market_df: pd.DataFrame,
     portfolio_value: Optional[float],
     portfolio_drop_pct: Optional[float],
+    buying_ladder_appendix: Optional[str] = None,
 ) -> str:
     """Build plain-text weekly digest body."""
     lines: List[str] = []
@@ -227,6 +228,10 @@ def build_weekly_digest_text(
         lines.append(f"- Suggested action: {recommendation['action']}")
         lines.append(f"  Reason: {recommendation['reason']}")
         lines.append(f"  Optional amount increase: {recommendation['increase']}")
+
+    if buying_ladder_appendix and buying_ladder_appendix.strip():
+        lines.append("")
+        lines.extend(buying_ladder_appendix.strip().splitlines())
 
     return "\n".join(lines)
 
