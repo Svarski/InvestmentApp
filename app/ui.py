@@ -1,4 +1,6 @@
 """Main UI rendering functions for the dashboard."""
+import streamlit as st
+st.write("APP RUNNING")
 
 from __future__ import annotations
 
@@ -10,7 +12,7 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import plotly.express as px
-import streamlit as st
+
 
 from alerts import AlertEngine, get_alert_settings
 from app.components import format_percent, format_price, render_info_banner, render_warning_messages
