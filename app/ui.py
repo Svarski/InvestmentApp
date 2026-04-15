@@ -1,8 +1,7 @@
 """Main UI rendering functions for the dashboard."""
 from __future__ import annotations
 
-import streamlit as st
-st.write("APP RUNNING")
+
 
 import json
 import logging
@@ -12,9 +11,10 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import plotly.express as px
+import streamlit as st
+#st.write("APP RUNNING")
 
-
-# from alerts import AlertEngine, get_alert_settings
+from alerts import AlertEngine, get_alert_settings
 from app.components import format_percent, format_price, render_info_banner, render_warning_messages
 from buying_ladder.ui import render_buying_ladder_card, render_buying_ladder_sidebar
 from config import CHART_PERIOD_OPTIONS, DEFAULT_CHART_PERIOD, DEFAULT_LOOKBACK_PERIOD, TRACKED_INSTRUMENTS
