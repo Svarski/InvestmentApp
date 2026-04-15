@@ -26,8 +26,11 @@ import db
 from buying_ladder.weekly_appendix import build_buying_ladder_weekly_appendix
 from services.reports.weekly_digest import (
     WeeklyDigestState,
-    build_weekly_digest_text,
+    build_daily_digest_message,
+    build_weekly_digest_html,
+    mark_daily_digest_sent,
     mark_weekly_digest_sent,
+    should_send_daily_digest,
     should_send_weekly_digest,
     update_weekly_digest_state,
 )
@@ -57,6 +60,9 @@ class WorkerConfig:
     weekly_summary_timezone: str = "UTC"
     weekly_summary_email_to: Optional[str] = None
     weekly_summary_state_file: str = "./data/weekly_digest_state.json"
+    daily_digest_enabled: bool = False
+    daily_digest_hour: int = 9
+    daily_digest_timezone: str = "UTC"
 
 
 @dataclass(frozen=True)
@@ -126,6 +132,11 @@ def load_worker_config_from_env() -> WorkerConfig:
         weekly_hour = 9
     weekly_channel = os.getenv("WEEKLY_SUMMARY_CHANNEL", "email").strip().lower()
     weekly_channel = weekly_channel if weekly_channel in {"email", "none"} else "email"
+    daily_hour_raw = os.getenv("DAILY_DIGEST_HOUR", "9")
+    try:
+        daily_hour = min(23, max(0, int(daily_hour_raw)))
+    except ValueError:
+        daily_hour = 9
 
     return WorkerConfig(
         interval_seconds=interval,
@@ -145,6 +156,9 @@ def load_worker_config_from_env() -> WorkerConfig:
         weekly_summary_timezone=os.getenv("WEEKLY_SUMMARY_TIMEZONE", "UTC"),
         weekly_summary_email_to=os.getenv("WEEKLY_SUMMARY_EMAIL_TO"),
         weekly_summary_state_file=os.getenv("WEEKLY_SUMMARY_STATE_FILE", "./data/weekly_digest_state.json"),
+        daily_digest_enabled=_parse_bool(os.getenv("DAILY_DIGEST_ENABLED"), default=False),
+        daily_digest_hour=daily_hour,
+        daily_digest_timezone=os.getenv("DAILY_DIGEST_TIMEZONE", "UTC"),
     )
 
 
@@ -497,6 +511,12 @@ def run_worker(config: WorkerConfig, alert_settings: AlertSettings) -> None:
         config.weekly_summary_timezone,
         config.weekly_summary_state_file,
     )
+    logger.info(
+        "Daily digest config: enabled=%s hour=%s tz=%s",
+        config.daily_digest_enabled,
+        config.daily_digest_hour,
+        config.daily_digest_timezone,
+    )
 
     try:
         db.init_db()
@@ -534,6 +554,12 @@ def run_worker(config: WorkerConfig, alert_settings: AlertSettings) -> None:
                         if cycle_result.portfolio_value is not None
                         else config.portfolio_value,
                         portfolio_drop_pct=cycle_result.portfolio_drop_pct,
+                    )
+                    _run_daily_digest_if_due(
+                        config=config,
+                        notifier=notifier,
+                        weekly_digest_state=weekly_digest_state,
+                        market_df=cycle_result.market_df,
                     )
                 else:
                     write_heartbeat(config.heartbeat_file, success=False)
@@ -601,15 +627,19 @@ def main() -> None:
             weekly_summary_timezone=worker_config.weekly_summary_timezone,
             weekly_summary_email_to=worker_config.weekly_summary_email_to,
             weekly_summary_state_file=worker_config.weekly_summary_state_file,
+            daily_digest_enabled=worker_config.daily_digest_enabled,
+            daily_digest_hour=worker_config.daily_digest_hour,
+            daily_digest_timezone=worker_config.daily_digest_timezone,
         )
 
     configure_logging(worker_config.log_level)
     alert_settings = load_alert_settings_from_env()
     logger.info(
-        "Effective startup config: alert_channel=%s weekly_summary_enabled=%s weekly_summary_channel=%s email_to_set=%s telegram_chat_id_set=%s",
+        "Effective startup config: alert_channel=%s weekly_summary_enabled=%s weekly_summary_channel=%s daily_digest_enabled=%s email_to_set=%s telegram_chat_id_set=%s",
         alert_settings.channel,
         worker_config.weekly_summary_enabled,
         worker_config.weekly_summary_channel,
+        worker_config.daily_digest_enabled,
         bool(alert_settings.email_to),
         bool(alert_settings.telegram_chat_id),
     )
@@ -658,15 +688,25 @@ def _run_weekly_digest_if_due(
     bl_appendix, bl_reason = build_buying_ladder_weekly_appendix(market_df)
     logger.info("Weekly buying ladder appendix: reason=%s has_body=%s", bl_reason, bool(bl_appendix))
 
-    body = build_weekly_digest_text(
+    html_body = build_weekly_digest_html(
         state=weekly_digest_state,
         market_df=market_df,
         portfolio_value=portfolio_value,
         portfolio_drop_pct=portfolio_drop_pct,
         buying_ladder_appendix=bl_appendix,
     )
+    body = (
+        "Weekly Investment Summary\n\n"
+        "This message is optimized for HTML-capable email clients.\n"
+        "If you cannot view HTML, please switch to an email client that supports rich content."
+    )
 
-    sent = notifier.send_weekly_summary_email(subject=subject, body=body, recipient=recipient)
+    sent = notifier.send_weekly_summary_email(
+        subject=subject,
+        body=body,
+        recipient=recipient,
+        html_body=html_body,
+    )
     if not sent:
         logger.warning("Weekly digest send failed.")
         return
@@ -677,6 +717,46 @@ def _run_weekly_digest_if_due(
     )
     weekly_digest_state.save_to_file(config.weekly_summary_state_file)
     logger.info("Weekly digest sent successfully to %s", recipient)
+
+
+def _run_daily_digest_if_due(
+    *,
+    config: WorkerConfig,
+    notifier: AlertNotifier,
+    weekly_digest_state: WeeklyDigestState,
+    market_df,
+) -> None:
+    if not should_send_daily_digest(
+        weekly_digest_state,
+        enabled=config.daily_digest_enabled,
+        hour=config.daily_digest_hour,
+        timezone_name=config.daily_digest_timezone,
+    ):
+        return
+
+    if market_df is None or market_df.empty:
+        logger.info("Daily digest skipped due to missing market data.")
+        return
+
+    if notifier.settings.channel not in {"telegram", "both"}:
+        logger.info("Daily digest skipped because Telegram channel is disabled.")
+        return
+
+    if not notifier.settings.telegram_bot_token or not notifier.settings.telegram_chat_id:
+        logger.info("Daily digest skipped because Telegram credentials are not configured.")
+        return
+
+    try:
+        message = build_daily_digest_message(market_df=market_df, state=weekly_digest_state)
+        sent = notifier.send_telegram(message)
+        if not sent:
+            logger.info("Daily digest skipped/failed on Telegram send path.")
+            return
+        mark_daily_digest_sent(weekly_digest_state, timezone_name=config.daily_digest_timezone)
+        weekly_digest_state.save_to_file(config.weekly_summary_state_file)
+        logger.info("Daily mini digest sent on Telegram.")
+    except Exception:
+        logger.exception("Daily digest send failed.")
 
 
 if __name__ == "__main__":

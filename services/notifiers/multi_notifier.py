@@ -72,25 +72,56 @@ class MultiNotifier:
 
         return NotificationStats(attempted_alerts=attempted_count, sent_alerts=sent_count)
 
-    def send_plain_email(self, subject: str, body: str, recipient: Optional[str]) -> bool:
+    def send_plain_email(
+        self,
+        subject: str,
+        body: str,
+        recipient: Optional[str],
+        html_body: Optional[str] = None,
+    ) -> bool:
         logger.info("MULTI NOTIFIER ACTIVE channel=%s", self.settings.channel)
         if self.settings.channel not in {"email", "both"}:
             logger.info("Plain email delivery skipped by channel setting: channel=%s", self.settings.channel)
             return False
 
         return self._send_channel(
-            send_fn=lambda: self.email.send_plain_email(subject=subject, body=body, recipient=recipient),
+            send_fn=lambda: self.email.send_plain_email(
+                subject=subject,
+                body=body,
+                recipient=recipient,
+                html_body=html_body,
+            ),
             channel_name="email",
             alert_id="plain_email",
         )
 
-    def send_plain_email_unchecked(self, subject: str, body: str, recipient: Optional[str]) -> bool:
+    def send_plain_email_unchecked(
+        self,
+        subject: str,
+        body: str,
+        recipient: Optional[str],
+        html_body: Optional[str] = None,
+    ) -> bool:
         """Send plain email without applying ALERT_CHANNEL gate."""
         logger.info("MULTI NOTIFIER ACTIVE weekly-email path")
         return self._send_channel(
-            send_fn=lambda: self.email.send_plain_email(subject=subject, body=body, recipient=recipient),
+            send_fn=lambda: self.email.send_plain_email(
+                subject=subject,
+                body=body,
+                recipient=recipient,
+                html_body=html_body,
+            ),
             channel_name="email",
             alert_id="weekly_plain_email",
+        )
+
+    def send_telegram_message_unchecked(self, message: str) -> bool:
+        """Send Telegram text message without applying ALERT_CHANNEL gate."""
+        logger.info("MULTI NOTIFIER ACTIVE telegram-message path")
+        return self._send_channel(
+            send_fn=lambda: self.telegram.send_message(message),
+            channel_name="telegram",
+            alert_id="daily_digest_telegram",
         )
 
     def _send_channel(self, send_fn: Callable[[], None], channel_name: str, alert_id: str) -> bool:

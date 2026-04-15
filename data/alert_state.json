@@ -1,32 +1,13 @@
 {
   "alerts": {
     "VWCE_drawdown": {
-      "triggered_levels": [
-        -3.0,
-        -2.0,
-        -1.0
-      ]
+      "triggered_levels": []
     },
     "CNDX_drawdown": {
-      "triggered_levels": [
-        -3.0,
-        -2.0,
-        -1.0
-      ]
+      "triggered_levels": []
     },
     "SPY_drawdown": {
-      "triggered_levels": [
-        -3.0,
-        -2.0,
-        -1.0
-      ]
-    },
-    "QQQ_drawdown": {
-      "triggered_levels": [
-        -3.0,
-        -2.0,
-        -1.0
-      ]
+      "triggered_levels": []
     },
     "vix_spike": {
       "triggered_levels": []

@@ -44,10 +44,21 @@ class AlertNotifier:
         """Send plain text email with retries; return True on success."""
         return self._multi_notifier.send_plain_email(subject=subject, body=body, recipient=recipient)
 
-    def send_weekly_summary_email(self, subject: str, body: str, recipient: Optional[str] = None) -> bool:
+    def send_weekly_summary_email(
+        self,
+        subject: str,
+        body: str,
+        recipient: Optional[str] = None,
+        html_body: Optional[str] = None,
+    ) -> bool:
         """Send weekly summary email independent of ALERT_CHANNEL."""
         return self._multi_notifier.send_plain_email_unchecked(
             subject=subject,
             body=body,
             recipient=recipient,
+            html_body=html_body,
         )
+
+    def send_telegram(self, message: str) -> bool:
+        """Send Telegram message independent of ALERT_CHANNEL."""
+        return self._multi_notifier.send_telegram_message_unchecked(message)

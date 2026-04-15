@@ -21,13 +21,17 @@ class TelegramNotifier:
         self.settings = settings
 
     def send_alert(self, alert: Alert) -> None:
+        text = f"[{alert.severity.upper()}] {alert.message}\n({alert.timestamp})"
+        self.send_message(text)
+        logger.info("Alert sent to telegram id=%s", alert.id)
+
+    def send_message(self, text: str) -> None:
         token = self.settings.telegram_bot_token
         chat_id = self.settings.telegram_chat_id
         if not token or not chat_id:
             raise ValueError("Telegram settings missing: bot token or chat id.")
 
         url = f"https://api.telegram.org/bot{token}/sendMessage"
-        text = f"[{alert.severity.upper()}] {alert.message}\n({alert.timestamp})"
         payload = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode("utf-8")
         request = urllib.request.Request(url=url, data=payload, method="POST")
 
@@ -40,5 +44,3 @@ class TelegramNotifier:
         parsed = json.loads(body)
         if not parsed.get("ok"):
             raise RuntimeError(f"Telegram API rejected message: {body}")
-
-        logger.info("Alert sent to telegram id=%s", alert.id)
