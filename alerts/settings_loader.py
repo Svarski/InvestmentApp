@@ -71,6 +71,7 @@ def get_alert_settings() -> AlertSettings:
     channel = channel if channel in {"none", "telegram", "email", "both"} else "none"
 
     return AlertSettings(
+        channel=channel,
         # Rule thresholds/settings (env override supported)
         drawdown_levels=_parse_float_tuple(os.getenv("ALERT_DRAWDOWN_LEVELS"), defaults.drawdown_levels),
         drawdown_alert_symbols=_parse_symbol_tuple(
