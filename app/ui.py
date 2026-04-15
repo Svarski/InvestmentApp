@@ -1,8 +1,8 @@
 """Main UI rendering functions for the dashboard."""
+from __future__ import annotations
+
 import streamlit as st
 st.write("APP RUNNING")
-
-from __future__ import annotations
 
 import json
 import logging
