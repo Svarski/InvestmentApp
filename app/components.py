@@ -21,7 +21,7 @@ def format_price(value: Optional[float]) -> str:
 
 
 def render_info_banner() -> None:
-    st.caption("Data source: yfinance. Values may be delayed and for informational use only.")
+    st.caption("Prices via Yahoo Finance — may be delayed. For information only.")
 
 
 def render_warning_messages(messages: list[str]) -> None:

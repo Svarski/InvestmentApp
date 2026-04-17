@@ -17,6 +17,9 @@ import streamlit as st
 from alerts import AlertEngine, get_alert_settings
 from app.components import format_percent, format_price, render_info_banner, render_warning_messages
 from buying_ladder.ui import render_buying_ladder_card, render_buying_ladder_sidebar
+from buying_ladder.logic import compute_buying_ladder
+from buying_ladder.models import merge_with_defaults
+from buying_ladder.storage import load_buying_ladder_settings
 from config import CHART_PERIOD_OPTIONS, DEFAULT_CHART_PERIOD, DEFAULT_LOOKBACK_PERIOD, TRACKED_INSTRUMENTS
 from db import get_portfolio_history, get_recent_alerts
 from logic.calculations import (
@@ -35,6 +38,71 @@ from services.market_data import (
 logger = logging.getLogger(__name__)
 
 WORKER_HEARTBEAT_MAX_AGE_SEC = 300
+
+
+def _decision_state_from_drawdown(drawdown_pct: Optional[float]) -> Tuple[str, str]:
+    """Map drawdown to headline + action (human, action-oriented)."""
+    if drawdown_pct is None:
+        return "Stay consistent", "Keep your plan"
+    if drawdown_pct <= -20:
+        return "📉 Market crash — deep drawdown", "Strong buying opportunity"
+    if drawdown_pct <= -10:
+        return "📉 Market dip — opportunity", "Increase exposure"
+    return "Stay consistent", "Keep investing steadily"
+
+
+def _render_investment_hero(market_df: pd.DataFrame) -> None:
+    """Top decision-first hero section."""
+    st.subheader("This month")
+    settings = merge_with_defaults(load_buying_ladder_settings())
+    result = compute_buying_ladder(settings, market_df)
+
+    recommended = result.recommended_monthly if result.feature_enabled else 0.0
+    headline, action_message = _decision_state_from_drawdown(result.drawdown_pct if result.feature_enabled else None)
+
+    with st.container(border=True):
+        st.markdown(
+            f"""
+            <div style="margin-bottom: 0.25rem;">
+              <div style="font-size: 2.35rem; font-weight: 700; line-height: 1.1; letter-spacing: -0.03em;">
+                {recommended:,.0f} €
+              </div>
+              <div style="font-size: 0.85rem; opacity: 0.72; margin-top: 0.35rem;">
+                Invest this month
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.markdown("")
+        st.markdown(f"**{headline}**")
+        st.markdown("")
+        st.markdown(f"**{action_message}**")
+        st.caption("Guidance only — not investment advice.")
+
+
+def _render_market_cards(display_df: pd.DataFrame) -> None:
+    """Stacked instrument cards; daily change uses metric delta for green/red semantics."""
+    if display_df.empty:
+        st.info("Market data is not available right now. Check back in a moment.")
+        return
+    fields = ["Symbol", "Name", "Ticker", "Price", "Daily Change %", "Drawdown from ATH %"]
+    for _, row in display_df[fields].iterrows():
+        with st.container(border=True):
+            title = str(row.get("Symbol") or row.get("Ticker") or "Instrument")
+            st.markdown(f"**{title}**")
+            daily_raw = row.get("Daily Change %")
+            delta_val: Optional[float] = None
+            if daily_raw is not None and not pd.isna(daily_raw):
+                try:
+                    delta_val = float(daily_raw)
+                except (TypeError, ValueError):
+                    delta_val = None
+            if delta_val is not None:
+                st.metric("Last price", format_price(row.get("Price")), delta=delta_val)
+            else:
+                st.metric("Last price", format_price(row.get("Price")))
+            st.caption(f"Down from peak: {format_percent(row.get('Drawdown from ATH %'))}")
 
 
 def _parse_last_success_timestamp_utc(value: object) -> Optional[datetime]:
@@ -104,15 +172,15 @@ def _render_portfolio_source_indicator() -> None:
     """Worker portfolio source and heartbeat freshness (last successful worker cycle)."""
     heartbeat_stale, src, last_ibkr = _read_worker_heartbeat_state()
     if heartbeat_stale:
-        st.error("Worker not running or heartbeat stale")
+        st.error("Live sync looks offline — showing last known data if any.")
     if src == "IBKR":
-        st.success("Portfolio source: IBKR")
+        st.success("Connected to IBKR")
     elif src == "IBKR_STALE":
-        st.warning("Portfolio source: IBKR (stale)")
+        st.warning("IBKR data may be outdated")
     else:
-        st.error("Portfolio source: Fallback")
+        st.info("Using saved data (not live IBKR)")
     if last_ibkr:
-        st.caption(f"Last IBKR update: {last_ibkr}")
+        st.caption(f"Last IBKR sync: {last_ibkr}")
 
 
 def _get_alert_engine() -> AlertEngine:
@@ -175,37 +243,55 @@ def _severity_style(alert: Dict[str, str]) -> Tuple[str, str]:
 
 def render_alerts_section() -> None:
     """Render recent alerts from session history."""
-    st.subheader("Alerts")
+    st.subheader("⚠️ Needs attention")
     alerts_history = st.session_state.get("alerts", [])
 
     if not alerts_history:
-        st.info("No active alerts")
+        st.info("You're all set — nothing needs your attention.")
         return
 
-    with st.expander("Recent alerts", expanded=True):
-        for alert in reversed(alerts_history):
-            style, severity_label = _severity_style(alert)
-            alert_text = (
-                f"[{severity_label}] {alert.get('message', 'Alert')}\n"
-                f"{alert.get('timestamp', '')} | {alert.get('type', 'unknown')}"
-            )
-            if style == "error":
-                st.error(alert_text)
-            elif style == "warning":
-                st.warning(alert_text)
-            else:
-                st.info(alert_text)
+    severity_rank = {"high": 3, "medium": 2, "low": 1}
+    sorted_alerts = sorted(
+        alerts_history,
+        key=lambda a: (
+            severity_rank.get(str(a.get("severity", "")).lower(), 0),
+            str(a.get("timestamp", "")),
+        ),
+        reverse=True,
+    )
+
+    top_alert = sorted_alerts[0]
+    style, _ = _severity_style(top_alert)
+    actionable_text = top_alert.get("message", "Alert")
+    if style == "error":
+        st.error(actionable_text)
+    elif style == "warning":
+        st.warning(actionable_text)
+    else:
+        st.info(actionable_text)
+
+    if len(sorted_alerts) > 1:
+        with st.expander("Other alerts", expanded=False):
+            for alert in sorted_alerts[1:5]:
+                detail = f"{alert.get('message', 'Alert')} ({alert.get('timestamp', '')})"
+                style, _ = _severity_style(alert)
+                if style == "error":
+                    st.error(detail)
+                elif style == "warning":
+                    st.warning(detail)
+                else:
+                    st.info(detail)
 
 
 def render_header() -> None:
     st.title("Personal Investment Dashboard")
-    st.caption("MVP - Market overview, manual portfolio tracking, and simple charts")
+    st.caption("Decide what to invest, spot issues early, see where you stand.")
     render_info_banner()
 
 
 def render_market_overview() -> pd.DataFrame:
-    """Render market overview table using configured tracked instruments."""
-    st.subheader("Market Overview")
+    """Render market overview as mobile-friendly instrument cards."""
+    st.subheader("Markets")
     overview_df, messages = build_market_overview(period=DEFAULT_LOOKBACK_PERIOD)
     render_warning_messages(messages)
 
@@ -214,17 +300,11 @@ def render_market_overview() -> pd.DataFrame:
         for col in ["Price", "Daily Change %", "Drawdown from ATH %"]:
             if col in display_df.columns:
                 display_df[col] = display_df[col].apply(lambda v: None if pd.isna(v) else v)
+    if display_df.empty:
+        st.info("Market data is not available right now. Check back in a moment.")
+        return overview_df
 
-    st.dataframe(
-        display_df[["Symbol", "Name", "Ticker", "Price", "Daily Change %", "Drawdown from ATH %"]],
-        width="stretch",
-        hide_index=True,
-        column_config={
-            "Price": st.column_config.NumberColumn("Price", format="%.2f"),
-            "Daily Change %": st.column_config.NumberColumn("Daily Change %", format="%.2f%%"),
-            "Drawdown from ATH %": st.column_config.NumberColumn("Drawdown from ATH %", format="%.2f%%"),
-        },
-    )
+    _render_market_cards(display_df)
     return overview_df
 
 
@@ -261,13 +341,13 @@ def _validate_portfolio_rows(portfolio_df: pd.DataFrame) -> pd.DataFrame:
 
 def render_portfolio_section() -> Optional[float]:
     """Render manual portfolio editor and computed portfolio metrics."""
-    st.subheader("Manual Portfolio")
-    st.caption("Enter holdings manually. Data is in-memory for this MVP session only.")
+    st.subheader("Portfolio")
+    st.caption("Edits here apply for this session only.")
     portfolio_input = _portfolio_input_table()
     cleaned_portfolio = _validate_portfolio_rows(portfolio_input)
 
     if cleaned_portfolio.empty:
-        st.info("Add at least one valid row with ticker, quantity, and average buy price.")
+        st.info("Add at least one holding: ticker, quantity, and average buy price.")
         return None
 
     unique_tickers = cleaned_portfolio["Ticker"].dropna().unique().tolist()
@@ -319,23 +399,9 @@ def render_portfolio_section() -> Optional[float]:
 
     if missing_tickers:
         tickers_text = ", ".join(sorted(set(missing_tickers)))
-        st.warning(f"Could not load current prices for: {tickers_text}")
+        st.warning(f"No live price for: {tickers_text}. Check the ticker or try again later.")
 
     result_df = pd.DataFrame(portfolio_rows)
-    st.dataframe(
-        result_df,
-        width="stretch",
-        hide_index=True,
-        column_config={
-            "Quantity": st.column_config.NumberColumn("Quantity", format="%.4f"),
-            "Avg Buy Price": st.column_config.NumberColumn("Avg Buy Price", format="%.2f"),
-            "Current Price": st.column_config.NumberColumn("Current Price", format="%.2f"),
-            "Cost Basis": st.column_config.NumberColumn("Cost Basis", format="%.2f"),
-            "Current Value": st.column_config.NumberColumn("Current Value", format="%.2f"),
-            "Unrealized PnL": st.column_config.NumberColumn("Unrealized PnL", format="%.2f"),
-            "Unrealized PnL %": st.column_config.NumberColumn("Unrealized PnL %", format="%.2f%%"),
-        },
-    )
 
     totals_df = result_df.dropna(subset=["Cost Basis", "Current Value", "Unrealized PnL"])
     if totals_df.empty:
@@ -346,24 +412,43 @@ def render_portfolio_section() -> Optional[float]:
     total_pnl = totals_df["Unrealized PnL"].sum()
     total_pnl_pct = calculate_unrealized_pnl_percent(total_pnl, total_cost_basis)
 
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Portfolio Value", format_price(total_current_value))
-    col2.metric("Cost Basis", format_price(total_cost_basis))
-    col3.metric("Unrealized PnL", format_price(total_pnl))
-    col4.metric("Unrealized PnL %", format_percent(total_pnl_pct))
+    st.markdown("")
+    c1, c2 = st.columns(2)
+    c1.metric("Portfolio value", format_price(total_current_value), delta=float(total_pnl))
+    c2.metric("Total return", format_percent(total_pnl_pct))
+    st.markdown("")
+    c3, c4 = st.columns(2)
+    c3.metric("Cost basis", format_price(total_cost_basis))
+    c4.metric("Unrealized gain / loss", format_price(total_pnl))
+
+    with st.expander("Holdings details", expanded=False):
+        st.dataframe(
+            result_df,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Quantity": st.column_config.NumberColumn("Quantity", format="%.4f"),
+                "Avg Buy Price": st.column_config.NumberColumn("Avg Buy Price", format="%.2f"),
+                "Current Price": st.column_config.NumberColumn("Current Price", format="%.2f"),
+                "Cost Basis": st.column_config.NumberColumn("Cost Basis", format="%.2f"),
+                "Current Value": st.column_config.NumberColumn("Current Value", format="%.2f"),
+                "Unrealized PnL": st.column_config.NumberColumn("Unrealized PnL", format="%.2f"),
+                "Unrealized PnL %": st.column_config.NumberColumn("Unrealized PnL %", format="%.2f%%"),
+            },
+        )
     return total_current_value
 
 
 def render_portfolio_performance_section() -> None:
     """Show persisted portfolio history from SQLite (worker) with value and growth charts."""
     st.divider()
-    st.subheader("📈 Portfolio Performance")
+    st.subheader("📈 Portfolio over time")
     _render_portfolio_source_indicator()
     days = st.selectbox("Period", [7, 30, 90], index=1, key="portfolio_performance_period")
 
     df = get_portfolio_history(days=days)
     if df.empty:
-        st.info("No portfolio data yet")
+        st.info("No history yet — data appears after your portfolio syncs.")
         return
 
     df = df.copy()
@@ -375,7 +460,7 @@ def render_portfolio_performance_section() -> None:
 
     df = df.dropna(subset=["timestamp", "total_value"])
     if df.empty:
-        st.info("No portfolio data yet")
+        st.info("No history yet — data appears after your portfolio syncs.")
         return
 
     df = df.sort_values("timestamp")
@@ -391,44 +476,44 @@ def render_portfolio_performance_section() -> None:
     df = df.set_index("timestamp")
     chart_df = df[["total_value", "growth_pct"]].dropna(how="any")
     if chart_df.empty:
-        st.info("No portfolio data yet")
+        st.info("No history yet — data appears after your portfolio syncs.")
         return
 
     last_value = float(chart_df["total_value"].iloc[-1])
     last_growth = float(chart_df["growth_pct"].iloc[-1])
 
     col1, col2 = st.columns(2)
-    col1.metric("Portfolio Value", f"{last_value:,.0f} €".replace(",", " "))
-    col2.metric("Growth", f"{last_growth:.2f} %", delta=last_growth)
+    col1.metric("Portfolio value", f"{last_value:,.0f} €".replace(",", " "))
+    col2.metric("Period return", f"{last_growth:.2f} %", delta=last_growth)
 
     st.markdown("")
 
     if len(chart_df) < 2:
-        st.warning("Not enough data for meaningful chart")
+        st.warning("Need more history to draw a useful chart.")
         return
 
     with st.container():
-        st.caption("Portfolio value over time (€)")
+        st.caption("Value (€)")
         st.line_chart(chart_df[["total_value"]])
-        st.caption("Growth (%)")
+        st.caption("Return in this period (%)")
         st.line_chart(chart_df[["growth_pct"]])
 
 
 def render_alert_history_section() -> None:
     """Show recent alerts persisted in SQLite (worker)."""
     st.divider()
-    st.subheader("🚨 Alert History")
+    st.subheader("Alert history")
 
     df = get_recent_alerts(limit=20)
     if df.empty:
-        st.info("No alerts yet")
+        st.info("No saved alerts yet.")
         return
 
     df = df.copy()
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
     df = df.dropna(subset=["timestamp"])
     if df.empty:
-        st.info("No valid alerts to display")
+        st.info("Nothing to show here.")
         return
     df = df.sort_values("timestamp", ascending=False, na_position="last")
     df["timestamp"] = df["timestamp"].dt.strftime("%Y-%m-%d %H:%M")
@@ -444,17 +529,18 @@ def render_alert_history_section() -> None:
     _msg = df["Message"].astype(str)
     df["Message"] = _msg.where(_msg.str.len() <= 80, _msg.str.slice(0, 77) + "...")
 
-    st.caption("Latest alerts (most recent first)")
+    st.caption("Newest first")
     st.dataframe(df, width="stretch", hide_index=True, height=300)
 
 
 def render_chart_section() -> None:
     """Render instrument price chart with selectable time range."""
-    st.subheader("Price Chart")
+    st.subheader("Price chart")
+    st.caption("Choose what to look at.")
     instrument_options = list(TRACKED_INSTRUMENTS.keys())
-    selected_symbol = st.selectbox("Instrument", options=instrument_options, index=0)
+    selected_symbol = st.selectbox("What to view", options=instrument_options, index=0)
     selected_period = st.selectbox(
-        "Time range",
+        "Range",
         options=CHART_PERIOD_OPTIONS,
         index=CHART_PERIOD_OPTIONS.index(DEFAULT_CHART_PERIOD),
     )
@@ -464,7 +550,7 @@ def render_chart_section() -> None:
     chart_df = normalize_history_for_chart(history)
     if chart_df is None:
         logger.info("Chart unavailable for symbol=%s ticker=%s", selected_symbol, selected_ticker)
-        st.info(f"No chart data available for {selected_symbol} ({selected_ticker}).")
+        st.info(f"No price history for {selected_symbol} right now — try another range or symbol.")
         return
 
     fig = px.line(
@@ -482,14 +568,50 @@ def render_dashboard() -> None:
     """Render the complete dashboard page."""
     render_buying_ladder_sidebar()
     render_header()
-    market_df = render_market_overview()
-    render_buying_ladder_card(market_df)
+
+    market_df, market_messages = build_market_overview(period=DEFAULT_LOOKBACK_PERIOD)
+
+    # 1) Investment decision (hero)
+    with st.container():
+        _render_investment_hero(market_df)
+
+    # Refresh market-based alerts before rendering the alert section.
+    _evaluate_alerts_safely(market_df=market_df, portfolio_value=None)
+
     st.divider()
-    portfolio_total_value = render_portfolio_section()
-    render_portfolio_performance_section()
-    render_alert_history_section()
+
+    # 2) Alerts (right after hero)
+    with st.container():
+        render_alerts_section()
+
+    st.divider()
+
+    # 3) Portfolio
+    with st.container():
+        portfolio_total_value = render_portfolio_section()
+
     _evaluate_alerts_safely(market_df=market_df, portfolio_value=portfolio_total_value)
+
     st.divider()
-    render_alerts_section()
+
+    # 4) Market data (de-emphasized)
+    with st.container():
+        st.subheader("Markets")
+        st.caption("Context for prices and drawdowns.")
+        render_warning_messages(market_messages)
+        display_df = market_df.copy()
+        if not display_df.empty:
+            for col in ["Price", "Daily Change %", "Drawdown from ATH %"]:
+                if col in display_df.columns:
+                    display_df[col] = display_df[col].apply(lambda v: None if pd.isna(v) else v)
+        _render_market_cards(display_df)
+
     st.divider()
-    render_chart_section()
+
+    # Secondary info and details
+    with st.container():
+        with st.expander("Details", expanded=False):
+            render_buying_ladder_card(market_df)
+            render_chart_section()
+            render_portfolio_performance_section()
+            render_alert_history_section()
