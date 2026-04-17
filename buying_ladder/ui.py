@@ -68,18 +68,6 @@ def _current_phases_row_count() -> int:
     return max(1, len(st.session_state.bl_phases_seed.index))
 
 
-def _fmt_pct(value: Optional[float]) -> str:
-    if value is None:
-        return "N/A"
-    return f"{value:.2f}%"
-
-
-def _fmt_gap(value: Optional[float]) -> str:
-    if value is None:
-        return "N/A"
-    return f"{value:.2f} pp"
-
-
 def render_buying_ladder_sidebar() -> None:
     """Dedicated sidebar block: configure and persist buying ladder settings."""
     st.sidebar.divider()
@@ -261,76 +249,50 @@ def render_buying_ladder_card(market_df: pd.DataFrame) -> None:
     if not result.feature_enabled:
         return
 
-    st.subheader("Behind this month's number")
+    split = compute_vwce_cndx_split(settings, result, market_df)
+    extra = result.extra_vs_base
 
-    st.markdown("**Market**")
-    c1, c2 = st.columns(2)
+    st.subheader("Plan")
+    plan_left, plan_right = st.columns(2)
+    with plan_left:
+        st.caption("Phase")
+        st.markdown(f"**{result.phase_label}**")
+        st.caption("Base monthly")
+        st.metric(" ", f"{result.base_monthly:,.0f} €")
+    with plan_right:
+        st.caption("Invest this month")
+        st.metric(" ", f"{result.recommended_monthly:,.0f} €")
+        st.caption("Extra vs base")
+        st.metric(" ", f"{extra:+,.0f} €")
+
+    st.markdown("")
+    st.subheader("Market")
     dd_text = "N/A" if result.drawdown_pct is None else f"{result.drawdown_pct:.2f}%"
-    with c1:
+    m_left, m_right = st.columns(2)
+    with m_left:
         st.caption("Down from peak")
         st.markdown(f"**{dd_text}**")
-    with c2:
+    with m_right:
         st.caption("Ladder step")
         st.markdown(f"**{result.ladder_step_label}**")
 
-    st.markdown("")
-    st.markdown("**Plan**")
-    p1, p2, p3 = st.columns(3)
-    with p1:
-        st.caption("Phase")
-        st.markdown(f"**{result.phase_label}**")
-    with p2:
-        st.caption("Base monthly")
-        st.metric(" ", f"{result.base_monthly:,.2f}")
-    with p3:
-        st.caption("Boost")
-        st.markdown(f"**{result.multiplier:.2f}×**")
-
-    st.markdown("")
-    i1, i2 = st.columns(2)
-    extra = result.extra_vs_base
-    with i1:
-        st.caption("Invest this month")
-        st.metric(" ", f"{result.recommended_monthly:,.2f}")
-    with i2:
-        st.caption("Extra vs base")
-        st.markdown(f"**{extra:+,.2f}**")
-
-    split = compute_vwce_cndx_split(settings, result, market_df)
     if split is not None and split.show_ui_block:
-        st.markdown("**Split idea: VWCE vs CNDX**")
-        st.caption("Optional — splits **Invest this month** using each fund's drawdown.")
-        g1, g2, g3 = st.columns(3)
-        with g1:
-            st.caption("VWCE down from peak")
-            st.markdown(f"**{_fmt_pct(split.vwce_drawdown_pct)}**")
-        with g2:
-            st.caption("CNDX down from peak")
-            st.markdown(f"**{_fmt_pct(split.cndx_drawdown_pct)}**")
-        with g3:
-            st.caption("Gap")
-            st.markdown(f"**{_fmt_gap(split.relative_gap_pct)}**")
-        st.caption(f"VWCE lens: **{split.regime_label.replace('_', ' ')}**")
-        h1, h2, h3 = st.columns(3)
-        with h1:
-            st.caption("Split")
-            st.markdown(f"**{split.allocation_label}**")
-        with h2:
-            st.caption("VWCE this month")
-            st.metric(" ", f"{split.vwce_amount:,.2f}")
-        with h3:
-            st.caption("CNDX this month")
-            st.metric(" ", f"{split.cndx_amount:,.2f}")
+        st.markdown("")
+        st.subheader("Allocation")
+        st.markdown(f"**{split.allocation_label}**")
+        a_left, a_right = st.columns(2)
+        with a_left:
+            st.caption("VWCE")
+            st.metric(" ", f"{split.vwce_amount:,.0f} €")
+        with a_right:
+            st.caption("CNDX")
+            st.metric(" ", f"{split.cndx_amount:,.0f} €")
 
+    st.markdown("")
     if settings.show_calculation_details:
         with st.expander("How we got here", expanded=False):
             for line in result.explanation_lines:
                 st.markdown(f"- {line}")
             if split is not None and split.show_ui_block:
-                st.markdown("**Allocation**")
                 for line in split.explanation_lines:
                     st.markdown(f"- {line}")
-    else:
-        hint = result.explanation_lines[-1] if result.explanation_lines else ""
-        if hint:
-            st.caption(hint)

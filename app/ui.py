@@ -6,22 +6,23 @@ from __future__ import annotations
 import html
 import json
 import logging
+import math
 import os
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
-import plotly.express as px
 import streamlit as st
 #st.write("APP RUNNING")
 
 from alerts import AlertEngine, get_alert_settings
-from app.components import format_percent, format_price, render_info_banner, render_warning_messages
+from app.components import format_percent, format_price, render_warning_messages
+from buying_ladder.allocation import compute_vwce_cndx_split
 from buying_ladder.ui import render_buying_ladder_card, render_buying_ladder_sidebar
 from buying_ladder.logic import compute_buying_ladder
 from buying_ladder.models import merge_with_defaults
 from buying_ladder.storage import load_buying_ladder_settings
-from config import CHART_PERIOD_OPTIONS, DEFAULT_CHART_PERIOD, DEFAULT_LOOKBACK_PERIOD, TRACKED_INSTRUMENTS
+from config import DEFAULT_LOOKBACK_PERIOD
 from db import get_portfolio_history, get_recent_alerts
 from logic.calculations import (
     calculate_cost_basis,
@@ -29,16 +30,70 @@ from logic.calculations import (
     calculate_unrealized_pnl,
     calculate_unrealized_pnl_percent,
 )
-from services.market_data import (
-    build_market_overview,
-    fetch_history_for_ticker,
-    get_latest_price_map,
-    normalize_history_for_chart,
-)
+from services.market_data import build_market_overview, get_latest_price_map
 
 logger = logging.getLogger(__name__)
 
 WORKER_HEARTBEAT_MAX_AGE_SEC = 300
+
+_HEADER_REMINDERS: List[str] = [
+    "Keep investing",
+    "Don't stop contributions",
+    "Market down = opportunity",
+    "Stay consistent",
+    "Don't sell in a crash",
+    "Ignore the noise",
+    "Discipline beats timing",
+    "Think long term",
+    "Stick to the plan",
+    "Volatility is normal",
+]
+
+
+def _vwce_drawdown_pct(market_df: Optional[pd.DataFrame]) -> Optional[float]:
+    """VWCE drawdown from market overview (UI only; no business logic change)."""
+    if market_df is None or market_df.empty:
+        return None
+    if "Symbol" not in market_df.columns or "Drawdown from ATH %" not in market_df.columns:
+        return None
+    sym = market_df["Symbol"].astype(str).str.upper().str.strip()
+    rows = market_df[sym == "VWCE"]
+    if rows.empty:
+        return None
+    val = rows["Drawdown from ATH %"].iloc[0]
+    if val is None or pd.isna(val):
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _context_reminder_from_drawdown(drawdown: Optional[float]) -> Optional[str]:
+    """Single context line from VWCE drawdown; None if drawdown unavailable."""
+    if drawdown is None:
+        return None
+    if drawdown <= -20:
+        return "Strong buying opportunity — stay aggressive"
+    if drawdown <= -10:
+        return "Market dip — consider increasing exposure"
+    if drawdown < 0:
+        return "Market slightly down — stay consistent"
+    return "Market stable — keep investing"
+
+
+def _daily_rotating_reminder() -> str:
+    day_of_year = datetime.now().timetuple().tm_yday
+    idx = day_of_year % len(_HEADER_REMINDERS)
+    return _HEADER_REMINDERS[idx]
+
+
+def _header_reminder_caption_text(market_df: Optional[pd.DataFrame]) -> str:
+    """One line: context from VWCE drawdown when available, else daily rotation."""
+    ctx = _context_reminder_from_drawdown(_vwce_drawdown_pct(market_df))
+    if ctx is not None:
+        return ctx
+    return _daily_rotating_reminder()
 
 
 def _action_line_from_drawdown(drawdown_pct: Optional[float]) -> str:
@@ -62,12 +117,27 @@ def _render_investment_hero(market_df: pd.DataFrame) -> None:
     action_line = _action_line_from_drawdown(result.drawdown_pct if result.feature_enabled else None)
     action_safe = html.escape(action_line)
 
+    allocation_html = ""
+    split = compute_vwce_cndx_split(settings, result, market_df)
+    if split is not None and split.show_ui_block:
+        try:
+            vw_amt = float(split.vwce_amount)
+            cndx_amt = float(split.cndx_amount)
+            if math.isfinite(vw_amt) and math.isfinite(cndx_amt):
+                allocation_html = (
+                    '<span style="font-size: 1.5rem; font-weight: 500; opacity: 1; white-space: normal;">'
+                    f"(VWCE {vw_amt:,.0f} € · CNDX {cndx_amt:,.0f} €)"
+                    "</span>"
+                )
+        except (TypeError, ValueError):
+            allocation_html = ""
+
     with st.container(border=True):
         st.markdown(
             f"""
             <div style="margin-bottom: 1.35rem;">
-              <div style="font-size: 2.35rem; font-weight: 700; line-height: 1.1; letter-spacing: -0.03em;">
-                {recommended:,.0f} €
+              <div style="font-size: 2.35rem; font-weight: 700; line-height: 1.25; letter-spacing: -0.03em; display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.35rem 0.5rem;">
+                <span>{recommended:,.0f} €</span>{allocation_html}
               </div>
               <div style="font-size: 0.85rem; opacity: 0.72; margin-top: 0.45rem;">
                 Invest this month
@@ -124,11 +194,14 @@ def _render_market_cards(display_df: pd.DataFrame) -> None:
             if daily_raw is not None and not pd.isna(daily_raw):
                 try:
                     delta_val = float(daily_raw)
+                    if not math.isfinite(delta_val):
+                        delta_val = None
                 except (TypeError, ValueError):
                     delta_val = None
             st.caption("Last price")
             if delta_val is not None:
-                st.metric(" ", format_price(row.get("Price")), delta=delta_val)
+                formatted_delta = f"{delta_val:+.2f}%"
+                st.metric(" ", format_price(row.get("Price")), delta=formatted_delta)
             else:
                 st.metric(" ", format_price(row.get("Price")))
             st.caption("Down from peak")
@@ -304,10 +377,18 @@ def render_alerts_section() -> None:
                     st.info(detail)
 
 
-def render_header() -> None:
-    st.title("Personal Investment Dashboard")
-    st.caption("Decide what to invest, spot issues early, see where you stand.")
-    render_info_banner()
+def render_header(market_df: Optional[pd.DataFrame] = None) -> None:
+    """Mindset + one reminder line (context from VWCE drawdown when available)."""
+    st.title("Investment Dashboard")
+    st.caption("Stay consistent. Ignore noise. Build long-term wealth.")
+    st.caption(f"💡 {_header_reminder_caption_text(market_df)}")
+    with st.expander("Why this matters", expanded=False):
+        st.markdown(
+            "- Don't stop investing\n"
+            "- Don't sell in a crash\n"
+            "- Market drops = opportunity\n"
+            "- Discipline beats strategy"
+        )
 
 
 def render_market_overview() -> pd.DataFrame:
@@ -582,47 +663,11 @@ def render_alert_history_section() -> None:
         st.dataframe(df, width="stretch", hide_index=True, height=220)
 
 
-def render_chart_section() -> None:
-    """Render instrument price chart with selectable time range."""
-    st.subheader("Price chart")
-    st.caption("Choose what to look at.")
-    instrument_options = list(TRACKED_INSTRUMENTS.keys())
-    selected_symbol = st.selectbox("What to view", options=instrument_options, index=0)
-    selected_period = st.selectbox(
-        "Range",
-        options=CHART_PERIOD_OPTIONS,
-        index=CHART_PERIOD_OPTIONS.index(DEFAULT_CHART_PERIOD),
-    )
-
-    selected_ticker = TRACKED_INSTRUMENTS[selected_symbol]["ticker"]
-    history = fetch_history_for_ticker(ticker=selected_ticker, period=selected_period)
-    chart_df = normalize_history_for_chart(history)
-    if chart_df is None:
-        logger.info("Chart unavailable for symbol=%s ticker=%s", selected_symbol, selected_ticker)
-        st.info(f"No price history for {selected_symbol} right now — try another range or symbol.")
-        return
-
-    fig = px.line(
-        chart_df,
-        x="Date",
-        y="Close",
-        title=f"{selected_symbol} - Close Price ({selected_period})",
-        labels={"Close": "Price", "Date": "Date"},
-    )
-    fig.update_layout(margin={"l": 10, "r": 10, "t": 50, "b": 10}, height=420)
-    st.plotly_chart(
-        fig,
-        width="stretch",
-        config={"displayModeBar": False},
-    )
-
-
 def render_dashboard() -> None:
     """Render the complete dashboard page."""
     render_buying_ladder_sidebar()
-    render_header()
-
     market_df, market_messages = build_market_overview(period=DEFAULT_LOOKBACK_PERIOD)
+    render_header(market_df)
 
     # 1) Investment decision (hero)
     with st.container():
@@ -678,6 +723,5 @@ def render_dashboard() -> None:
     with st.container():
         with st.expander("Details", expanded=False):
             render_buying_ladder_card(market_df)
-            render_chart_section()
             render_portfolio_performance_section()
             render_alert_history_section()
