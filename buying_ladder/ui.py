@@ -262,36 +262,65 @@ def render_buying_ladder_card(market_df: pd.DataFrame) -> None:
         return
 
     st.subheader("Behind this month's number")
-    st.caption(f"Compared to **{result.benchmark_symbol}** (down from peak).")
 
+    st.markdown("**Market**")
     c1, c2 = st.columns(2)
     dd_text = "N/A" if result.drawdown_pct is None else f"{result.drawdown_pct:.2f}%"
-    c1.metric("Down from peak", dd_text)
-    c2.metric("Ladder step", result.ladder_step_label)
+    with c1:
+        st.caption("Down from peak")
+        st.markdown(f"**{dd_text}**")
+    with c2:
+        st.caption("Ladder step")
+        st.markdown(f"**{result.ladder_step_label}**")
 
-    c3, c4 = st.columns(2)
-    c3.metric("Plan phase", result.phase_label)
-    c4.metric("Boost", f"{result.multiplier:.2f}×")
+    st.markdown("")
+    st.markdown("**Plan**")
+    p1, p2, p3 = st.columns(3)
+    with p1:
+        st.caption("Phase")
+        st.markdown(f"**{result.phase_label}**")
+    with p2:
+        st.caption("Base monthly")
+        st.metric(" ", f"{result.base_monthly:,.2f}")
+    with p3:
+        st.caption("Boost")
+        st.markdown(f"**{result.multiplier:.2f}×**")
 
-    c5, c6, c7 = st.columns(3)
-    c5.metric("Base plan (monthly)", f"{result.base_monthly:,.2f}")
-    c6.metric("Invest this month", f"{result.recommended_monthly:,.2f}")
+    st.markdown("")
+    i1, i2 = st.columns(2)
     extra = result.extra_vs_base
-    c7.metric("Extra vs base", f"{extra:+,.2f}")
+    with i1:
+        st.caption("Invest this month")
+        st.metric(" ", f"{result.recommended_monthly:,.2f}")
+    with i2:
+        st.caption("Extra vs base")
+        st.markdown(f"**{extra:+,.2f}**")
 
     split = compute_vwce_cndx_split(settings, result, market_df)
     if split is not None and split.show_ui_block:
         st.markdown("**Split idea: VWCE vs CNDX**")
-        st.caption("Optional — divides **Invest this month** between the two, using each fund’s drawdown.")
+        st.caption("Optional — splits **Invest this month** using each fund's drawdown.")
         g1, g2, g3 = st.columns(3)
-        g1.metric("VWCE down from peak", _fmt_pct(split.vwce_drawdown_pct))
-        g2.metric("CNDX down from peak", _fmt_pct(split.cndx_drawdown_pct))
-        g3.metric("Gap", _fmt_gap(split.relative_gap_pct))
+        with g1:
+            st.caption("VWCE down from peak")
+            st.markdown(f"**{_fmt_pct(split.vwce_drawdown_pct)}**")
+        with g2:
+            st.caption("CNDX down from peak")
+            st.markdown(f"**{_fmt_pct(split.cndx_drawdown_pct)}**")
+        with g3:
+            st.caption("Gap")
+            st.markdown(f"**{_fmt_gap(split.relative_gap_pct)}**")
         st.caption(f"VWCE lens: **{split.regime_label.replace('_', ' ')}**")
         h1, h2, h3 = st.columns(3)
-        h1.metric("Split", split.allocation_label)
-        h2.metric("VWCE this month", f"{split.vwce_amount:,.2f}")
-        h3.metric("CNDX this month", f"{split.cndx_amount:,.2f}")
+        with h1:
+            st.caption("Split")
+            st.markdown(f"**{split.allocation_label}**")
+        with h2:
+            st.caption("VWCE this month")
+            st.metric(" ", f"{split.vwce_amount:,.2f}")
+        with h3:
+            st.caption("CNDX this month")
+            st.metric(" ", f"{split.cndx_amount:,.2f}")
 
     if settings.show_calculation_details:
         with st.expander("How we got here", expanded=False):

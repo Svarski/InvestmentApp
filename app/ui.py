@@ -3,6 +3,7 @@ from __future__ import annotations
 
 
 
+import html
 import json
 import logging
 import os
@@ -40,15 +41,15 @@ logger = logging.getLogger(__name__)
 WORKER_HEARTBEAT_MAX_AGE_SEC = 300
 
 
-def _decision_state_from_drawdown(drawdown_pct: Optional[float]) -> Tuple[str, str]:
-    """Map drawdown to headline + action (human, action-oriented)."""
+def _action_line_from_drawdown(drawdown_pct: Optional[float]) -> str:
+    """Single confident action line for hero."""
     if drawdown_pct is None:
-        return "Stay consistent", "Keep your plan"
+        return "Keep investing"
     if drawdown_pct <= -20:
-        return "📉 Market crash — deep drawdown", "Strong buying opportunity"
+        return "📉 Strong buying opportunity — deep drawdown"
     if drawdown_pct <= -10:
-        return "📉 Market dip — opportunity", "Increase exposure"
-    return "Stay consistent", "Keep investing steadily"
+        return "📉 Increase exposure — market dip"
+    return "Keep investing"
 
 
 def _render_investment_hero(market_df: pd.DataFrame) -> None:
@@ -58,27 +59,51 @@ def _render_investment_hero(market_df: pd.DataFrame) -> None:
     result = compute_buying_ladder(settings, market_df)
 
     recommended = result.recommended_monthly if result.feature_enabled else 0.0
-    headline, action_message = _decision_state_from_drawdown(result.drawdown_pct if result.feature_enabled else None)
+    action_line = _action_line_from_drawdown(result.drawdown_pct if result.feature_enabled else None)
+    action_safe = html.escape(action_line)
 
     with st.container(border=True):
         st.markdown(
             f"""
-            <div style="margin-bottom: 0.25rem;">
+            <div style="margin-bottom: 1.35rem;">
               <div style="font-size: 2.35rem; font-weight: 700; line-height: 1.1; letter-spacing: -0.03em;">
                 {recommended:,.0f} €
               </div>
-              <div style="font-size: 0.85rem; opacity: 0.72; margin-top: 0.35rem;">
+              <div style="font-size: 0.85rem; opacity: 0.72; margin-top: 0.45rem;">
                 Invest this month
               </div>
+            </div>
+            <div style="margin-bottom: 1.5rem;">
+              <span style="font-size: 1.1rem; font-weight: 600;">{action_safe}</span>
             </div>
             """,
             unsafe_allow_html=True,
         )
-        st.markdown("")
-        st.markdown(f"**{headline}**")
-        st.markdown("")
-        st.markdown(f"**{action_message}**")
         st.caption("Guidance only — not investment advice.")
+        st.markdown("")
+
+
+_PRIMARY_MARKET_SYMBOLS = frozenset({"VWCE", "CNDX"})
+
+# Short human descriptions for market cards (UI only).
+_SYMBOL_DESCRIPTIONS: Dict[str, str] = {
+    "VWCE": "Global stock market ETF (all-world exposure)",
+    "CNDX": "Nasdaq 100 (tech-focused companies)",
+    "SPY": "S&P 500 (largest US companies)",
+    "VIX": "Volatility index (market fear gauge)",
+    "DXY": "US Dollar strength index",
+    "TNX": "10-year US Treasury yield",
+}
+
+
+def _split_market_display_df(display_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Primary row(s) for main view vs the rest for 'More markets'."""
+    if display_df.empty or "Symbol" not in display_df.columns:
+        return display_df, pd.DataFrame()
+    sym = display_df["Symbol"].astype(str).str.upper().str.strip()
+    primary = display_df[sym.isin(_PRIMARY_MARKET_SYMBOLS)].copy()
+    rest = display_df[~sym.isin(_PRIMARY_MARKET_SYMBOLS)].copy()
+    return primary, rest
 
 
 def _render_market_cards(display_df: pd.DataFrame) -> None:
@@ -91,6 +116,9 @@ def _render_market_cards(display_df: pd.DataFrame) -> None:
         with st.container(border=True):
             title = str(row.get("Symbol") or row.get("Ticker") or "Instrument")
             st.markdown(f"**{title}**")
+            sym_key = title.strip().upper()
+            if sym_key in _SYMBOL_DESCRIPTIONS:
+                st.caption(_SYMBOL_DESCRIPTIONS[sym_key])
             daily_raw = row.get("Daily Change %")
             delta_val: Optional[float] = None
             if daily_raw is not None and not pd.isna(daily_raw):
@@ -98,11 +126,13 @@ def _render_market_cards(display_df: pd.DataFrame) -> None:
                     delta_val = float(daily_raw)
                 except (TypeError, ValueError):
                     delta_val = None
+            st.caption("Last price")
             if delta_val is not None:
-                st.metric("Last price", format_price(row.get("Price")), delta=delta_val)
+                st.metric(" ", format_price(row.get("Price")), delta=delta_val)
             else:
-                st.metric("Last price", format_price(row.get("Price")))
-            st.caption(f"Down from peak: {format_percent(row.get('Drawdown from ATH %'))}")
+                st.metric(" ", format_price(row.get("Price")))
+            st.caption("Down from peak")
+            st.markdown(f"**{format_percent(row.get('Drawdown from ATH %'))}**")
 
 
 def _parse_last_success_timestamp_utc(value: object) -> Optional[datetime]:
@@ -169,18 +199,8 @@ def _read_worker_heartbeat_state() -> Tuple[bool, str, Optional[str]]:
 
 
 def _render_portfolio_source_indicator() -> None:
-    """Worker portfolio source and heartbeat freshness (last successful worker cycle)."""
-    heartbeat_stale, src, last_ibkr = _read_worker_heartbeat_state()
-    if heartbeat_stale:
-        st.error("Live sync looks offline — showing last known data if any.")
-    if src == "IBKR":
-        st.success("Connected to IBKR")
-    elif src == "IBKR_STALE":
-        st.warning("IBKR data may be outdated")
-    else:
-        st.info("Using saved data (not live IBKR)")
-    if last_ibkr:
-        st.caption(f"Last IBKR sync: {last_ibkr}")
+    """Neutral data freshness line (no technical source jargon)."""
+    st.caption("Using last available data")
 
 
 def _get_alert_engine() -> AlertEngine:
@@ -243,13 +263,14 @@ def _severity_style(alert: Dict[str, str]) -> Tuple[str, str]:
 
 def render_alerts_section() -> None:
     """Render recent alerts from session history."""
-    st.subheader("⚠️ Needs attention")
     alerts_history = st.session_state.get("alerts", [])
 
     if not alerts_history:
-        st.info("You're all set — nothing needs your attention.")
+        st.subheader("All clear")
+        st.info("Nothing needs your attention")
         return
 
+    st.subheader("Needs attention")
     severity_rank = {"high": 3, "medium": 2, "low": 1}
     sorted_alerts = sorted(
         alerts_history,
@@ -291,7 +312,7 @@ def render_header() -> None:
 
 def render_market_overview() -> pd.DataFrame:
     """Render market overview as mobile-friendly instrument cards."""
-    st.subheader("Markets")
+    st.subheader("Market snapshot")
     overview_df, messages = build_market_overview(period=DEFAULT_LOOKBACK_PERIOD)
     render_warning_messages(messages)
 
@@ -304,7 +325,17 @@ def render_market_overview() -> pd.DataFrame:
         st.info("Market data is not available right now. Check back in a moment.")
         return overview_df
 
-    _render_market_cards(display_df)
+    primary, rest = _split_market_display_df(display_df)
+    if primary.empty:
+        if rest.empty:
+            st.info("Market data is not available right now. Check back in a moment.")
+        else:
+            st.caption("VWCE & CNDX will show here when available.")
+    else:
+        _render_market_cards(primary)
+    if not rest.empty:
+        with st.expander("More markets", expanded=False):
+            _render_market_cards(rest)
     return overview_df
 
 
@@ -343,12 +374,15 @@ def render_portfolio_section() -> Optional[float]:
     """Render manual portfolio editor and computed portfolio metrics."""
     st.subheader("Portfolio")
     st.caption("Edits here apply for this session only.")
+    if not st.session_state.get("_portfolio_has_holdings", False):
+        st.info("No holdings yet — add your first position below.")
     portfolio_input = _portfolio_input_table()
     cleaned_portfolio = _validate_portfolio_rows(portfolio_input)
 
     if cleaned_portfolio.empty:
-        st.info("Add at least one holding: ticker, quantity, and average buy price.")
+        st.session_state["_portfolio_has_holdings"] = False
         return None
+    st.session_state["_portfolio_has_holdings"] = True
 
     unique_tickers = cleaned_portfolio["Ticker"].dropna().unique().tolist()
     latest_prices = get_latest_price_map(unique_tickers)
@@ -405,6 +439,21 @@ def render_portfolio_section() -> Optional[float]:
 
     totals_df = result_df.dropna(subset=["Cost Basis", "Current Value", "Unrealized PnL"])
     if totals_df.empty:
+        with st.expander("Holdings", expanded=False):
+            st.dataframe(
+                result_df,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "Quantity": st.column_config.NumberColumn("Quantity", format="%.4f"),
+                    "Avg Buy Price": st.column_config.NumberColumn("Avg Buy Price", format="%.2f"),
+                    "Current Price": st.column_config.NumberColumn("Current Price", format="%.2f"),
+                    "Cost Basis": st.column_config.NumberColumn("Cost Basis", format="%.2f"),
+                    "Current Value": st.column_config.NumberColumn("Current Value", format="%.2f"),
+                    "Unrealized PnL": st.column_config.NumberColumn("Unrealized PnL", format="%.2f"),
+                    "Unrealized PnL %": st.column_config.NumberColumn("Unrealized PnL %", format="%.2f%%"),
+                },
+            )
         return None
 
     total_cost_basis = totals_df["Cost Basis"].sum()
@@ -421,7 +470,7 @@ def render_portfolio_section() -> Optional[float]:
     c3.metric("Cost basis", format_price(total_cost_basis))
     c4.metric("Unrealized gain / loss", format_price(total_pnl))
 
-    with st.expander("Holdings details", expanded=False):
+    with st.expander("Holdings", expanded=False):
         st.dataframe(
             result_df,
             width="stretch",
@@ -502,9 +551,8 @@ def render_portfolio_performance_section() -> None:
 def render_alert_history_section() -> None:
     """Show recent alerts persisted in SQLite (worker)."""
     st.divider()
-    st.subheader("Alert history")
 
-    df = get_recent_alerts(limit=20)
+    df = get_recent_alerts(limit=5)
     if df.empty:
         st.info("No saved alerts yet.")
         return
@@ -529,8 +577,9 @@ def render_alert_history_section() -> None:
     _msg = df["Message"].astype(str)
     df["Message"] = _msg.where(_msg.str.len() <= 80, _msg.str.slice(0, 77) + "...")
 
-    st.caption("Newest first")
-    st.dataframe(df, width="stretch", hide_index=True, height=300)
+    with st.expander("Alert history", expanded=False):
+        st.caption("Newest first — up to 5 rows.")
+        st.dataframe(df, width="stretch", hide_index=True, height=220)
 
 
 def render_chart_section() -> None:
@@ -561,7 +610,11 @@ def render_chart_section() -> None:
         labels={"Close": "Price", "Date": "Date"},
     )
     fig.update_layout(margin={"l": 10, "r": 10, "t": 50, "b": 10}, height=420)
-    st.plotly_chart(fig, width="stretch")
+    st.plotly_chart(
+        fig,
+        width="stretch",
+        config={"displayModeBar": False},
+    )
 
 
 def render_dashboard() -> None:
@@ -596,7 +649,7 @@ def render_dashboard() -> None:
 
     # 4) Market data (de-emphasized)
     with st.container():
-        st.subheader("Markets")
+        st.subheader("Market snapshot")
         st.caption("Context for prices and drawdowns.")
         render_warning_messages(market_messages)
         display_df = market_df.copy()
@@ -604,7 +657,20 @@ def render_dashboard() -> None:
             for col in ["Price", "Daily Change %", "Drawdown from ATH %"]:
                 if col in display_df.columns:
                     display_df[col] = display_df[col].apply(lambda v: None if pd.isna(v) else v)
-        _render_market_cards(display_df)
+        if display_df.empty:
+            st.info("Market data is not available right now. Check back in a moment.")
+        else:
+            primary, rest = _split_market_display_df(display_df)
+            if primary.empty:
+                if rest.empty:
+                    st.info("Market data is not available right now. Check back in a moment.")
+                else:
+                    st.caption("VWCE & CNDX will show here when available.")
+            else:
+                _render_market_cards(primary)
+            if not rest.empty:
+                with st.expander("More markets", expanded=False):
+                    _render_market_cards(rest)
 
     st.divider()
 
