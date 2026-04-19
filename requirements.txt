@@ -1,4 +1,10 @@
 streamlit
+fastapi
+uvicorn[standard]
+jinja2
+httpx
+websockets
+python-multipart
 yfinance
 pandas
 plotly

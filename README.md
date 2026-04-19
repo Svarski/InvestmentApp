@@ -77,6 +77,30 @@ streamlit run main.py
 
 Then open the local URL shown in the terminal (usually `http://localhost:8501`).
 
+### Optional: FastAPI login in front of Streamlit
+
+To replace Nginx Basic Auth with a real HTML login form, run Streamlit on `127.0.0.1:8501` and start the auth gateway (separate process) on port `8000`:
+
+```bash
+set APP_USERNAME=your_user
+set APP_PASSWORD=your_secret
+set AUTH_COOKIE_SECURE=false
+uvicorn auth_server:app --host 0.0.0.0 --port 8000
+```
+
+On Linux/macOS use `export` instead of `set`. Point Nginx at this gateway (`proxy_pass` to `http://127.0.0.1:8000`), not directly at Streamlit. Environment variables:
+
+- `APP_USERNAME`, `APP_PASSWORD` (required for login)
+- `STREAMLIT_ORIGIN` (default `http://127.0.0.1:8501`)
+- `AUTH_COOKIE_SECURE=true` when the site is served over HTTPS
+- Optional: `AUTH_SESSION_COOKIE`, `AUTH_SESSION_VALUE`, `AUTH_SESSION_MAX_AGE`
+
+Logout: open `/logout` in the browser.
+
+**Nginx:** Change the `location /` block that currently proxies to port `8501` so it proxies to port `8000` (the FastAPI app). Keep WebSocket upgrade headers (`Upgrade`, `Connection`) as you already do for Streamlit; the gateway forwards WS to Streamlit.
+
+In Docker Compose, set `STREAMLIT_ORIGIN` to the Streamlit service URL reachable from the auth container (for example `http://streamlit:8501`) and expose the auth process on the port Nginx uses.
+
 ## Run background worker
 
 The background worker evaluates alerts independently from the UI.
