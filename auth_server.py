@@ -310,11 +310,20 @@ async def _proxy_websocket(websocket: WebSocket, path: str) -> None:
     await websocket.accept()
 
     uri = _upstream_ws_url(path, websocket.scope.get("query_string") or b"")
+
+    extra = []
+    for key, value in websocket.headers.items():
+        if key.lower() == "host":
+            continue
+        extra.append((key, value))
+
     cookie_in = websocket.headers.get("cookie")
-    extra: list[tuple[str, str]] = []
     stripped = strip_auth_cookie(cookie_in)
     if stripped:
+        extra = [(k, v) for (k, v) in extra if k.lower() != "cookie"]
         extra.append(("Cookie", stripped))
+
+    extra.append(("Origin", STREAMLIT_ORIGIN))
 
     subprotocols = list(websocket.scope.get("subprotocols") or [])
 
@@ -324,13 +333,14 @@ async def _proxy_websocket(websocket: WebSocket, path: str) -> None:
             additional_headers=extra,
             subprotocols=subprotocols if subprotocols else None,
             max_size=None,
+            ping_interval=None,
         ) as upstream:
-            async def client_to_upstream() -> None:
+
+            async def client_to_upstream():
                 try:
                     while True:
                         msg = await websocket.receive()
-                        mtype = msg.get("type")
-                        if mtype == "websocket.disconnect":
+                        if msg["type"] == "websocket.disconnect":
                             break
                         if "text" in msg:
                             await upstream.send(msg["text"])
@@ -339,7 +349,7 @@ async def _proxy_websocket(websocket: WebSocket, path: str) -> None:
                 except Exception:
                     pass
 
-            async def upstream_to_client() -> None:
+            async def upstream_to_client():
                 try:
                     async for message in upstream:
                         if isinstance(message, str):
@@ -350,8 +360,7 @@ async def _proxy_websocket(websocket: WebSocket, path: str) -> None:
                     pass
 
             await asyncio.gather(client_to_upstream(), upstream_to_client())
-    except OSError:
-        await websocket.close(code=1011)
+
     except Exception:
         await websocket.close(code=1011)
 
