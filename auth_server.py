@@ -252,7 +252,7 @@ async def _proxy_http(request: Request, path: str) -> Response:
     client: httpx.AsyncClient = request.app.state.http
     url = _upstream_http_url(path, request.url.query)
     body = await request.body()
-    headers = forward_request_headers(request)
+    #headers = forward_request_headers(request)
 
     req = client.build_request(request.method, url, headers=headers, content=body)
     try:
@@ -302,67 +302,32 @@ def _ws_session_ok(websocket: WebSocket) -> bool:
     return websocket.cookies.get(SESSION_COOKIE_NAME) == SESSION_COOKIE_VALUE
 
 
-async def _proxy_websocket(websocket: WebSocket, path: str) -> None:
-    if not _ws_session_ok(websocket):
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-        return
+async def _proxy_websocket(client_ws, path: str):
+    upstream_url = f"ws://app:8501{path}"
 
-    await websocket.accept()
+    async with websockets.connect(
+        upstream_url,
+        extra_headers={
+            "Origin": "http://app:8501",
+        },
+        ping_interval=None,
+    ) as upstream_ws:
 
-    uri = _upstream_ws_url(path, websocket.scope.get("query_string") or b"")
+        async def from_client():
+            try:
+                async for msg in client_ws.iter_text():
+                    await upstream_ws.send(msg)
+            except Exception:
+                pass
 
-    extra = []
-    for key, value in websocket.headers.items():
-        if key.lower() == "host":
-            continue
-        extra.append((key, value))
+        async def from_upstream():
+            try:
+                async for msg in upstream_ws:
+                    await client_ws.send_text(msg)
+            except Exception:
+                pass
 
-    cookie_in = websocket.headers.get("cookie")
-    stripped = strip_auth_cookie(cookie_in)
-    if stripped:
-        extra = [(k, v) for (k, v) in extra if k.lower() != "cookie"]
-        extra.append(("Cookie", stripped))
-
-    extra.append(("Origin", STREAMLIT_ORIGIN))
-
-    subprotocols = list(websocket.scope.get("subprotocols") or [])
-
-    try:
-        async with websockets.connect(
-            uri,
-            additional_headers=extra,
-            subprotocols=subprotocols if subprotocols else None,
-            max_size=None,
-            ping_interval=None,
-        ) as upstream:
-
-            async def client_to_upstream():
-                try:
-                    while True:
-                        msg = await websocket.receive()
-                        if msg["type"] == "websocket.disconnect":
-                            break
-                        if "text" in msg:
-                            await upstream.send(msg["text"])
-                        elif "bytes" in msg:
-                            await upstream.send(msg["bytes"])
-                except Exception:
-                    pass
-
-            async def upstream_to_client():
-                try:
-                    async for message in upstream:
-                        if isinstance(message, str):
-                            await websocket.send_text(message)
-                        else:
-                            await websocket.send_bytes(message)
-                except Exception:
-                    pass
-
-            await asyncio.gather(client_to_upstream(), upstream_to_client())
-
-    except Exception:
-        await websocket.close(code=1011)
+        await asyncio.gather(from_client(), from_upstream())
 
 
 @app.websocket("/{path:path}")
