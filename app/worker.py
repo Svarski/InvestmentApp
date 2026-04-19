@@ -35,6 +35,7 @@ from services.reports.weekly_digest import (
     update_weekly_digest_state,
 )
 from services.ibkr_client import IBKRClient
+from services.portfolio_sync import run_portfolio_sync
 from services.market_data import build_market_overview, fetch_history_for_ticker_uncached
 
 logger = logging.getLogger("investment_worker")
@@ -63,6 +64,8 @@ class WorkerConfig:
     daily_digest_enabled: bool = False
     daily_digest_hour: int = 9
     daily_digest_timezone: str = "UTC"
+    ibkr_sync_enabled: bool = False
+    ibkr_sync_hour: int = 18
 
 
 @dataclass(frozen=True)
@@ -137,6 +140,11 @@ def load_worker_config_from_env() -> WorkerConfig:
         daily_hour = min(23, max(0, int(daily_hour_raw)))
     except ValueError:
         daily_hour = 9
+    ibkr_sync_hour_raw = os.getenv("IBKR_SYNC_HOUR", "18")
+    try:
+        ibkr_sync_hour = min(23, max(0, int(ibkr_sync_hour_raw)))
+    except ValueError:
+        ibkr_sync_hour = 18
 
     return WorkerConfig(
         interval_seconds=interval,
@@ -159,6 +167,8 @@ def load_worker_config_from_env() -> WorkerConfig:
         daily_digest_enabled=_parse_bool(os.getenv("DAILY_DIGEST_ENABLED"), default=False),
         daily_digest_hour=daily_hour,
         daily_digest_timezone=os.getenv("DAILY_DIGEST_TIMEZONE", "UTC"),
+        ibkr_sync_enabled=_parse_bool(os.getenv("IBKR_SYNC_ENABLED"), default=False),
+        ibkr_sync_hour=ibkr_sync_hour,
     )
 
 
@@ -517,6 +527,11 @@ def run_worker(config: WorkerConfig, alert_settings: AlertSettings) -> None:
         config.daily_digest_hour,
         config.daily_digest_timezone,
     )
+    logger.info(
+        "IBKR sync config: enabled=%s hour=%s",
+        config.ibkr_sync_enabled,
+        config.ibkr_sync_hour,
+    )
 
     try:
         db.init_db()
@@ -561,6 +576,13 @@ def run_worker(config: WorkerConfig, alert_settings: AlertSettings) -> None:
                         weekly_digest_state=weekly_digest_state,
                         market_df=cycle_result.market_df,
                     )
+                    if config.ibkr_sync_enabled:
+                        try:
+                            current_hour = datetime.now(timezone.utc).hour
+                            if current_hour >= config.ibkr_sync_hour:
+                                run_portfolio_sync()
+                        except Exception:
+                            logger.exception("IBKR daily sync failed.")
                 else:
                     write_heartbeat(config.heartbeat_file, success=False)
             except Exception:
@@ -630,6 +652,8 @@ def main() -> None:
             daily_digest_enabled=worker_config.daily_digest_enabled,
             daily_digest_hour=worker_config.daily_digest_hour,
             daily_digest_timezone=worker_config.daily_digest_timezone,
+            ibkr_sync_enabled=worker_config.ibkr_sync_enabled,
+            ibkr_sync_hour=worker_config.ibkr_sync_hour,
         )
 
     configure_logging(worker_config.log_level)

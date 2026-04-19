@@ -23,14 +23,8 @@ from buying_ladder.logic import compute_buying_ladder
 from buying_ladder.models import merge_with_defaults
 from buying_ladder.storage import load_buying_ladder_settings
 from config import DEFAULT_LOOKBACK_PERIOD
-from db import get_portfolio_history, get_recent_alerts
-from logic.calculations import (
-    calculate_cost_basis,
-    calculate_market_value,
-    calculate_unrealized_pnl,
-    calculate_unrealized_pnl_percent,
-)
-from services.market_data import build_market_overview, get_latest_price_map
+from db import get_latest_portfolio_snapshot, get_portfolio_history, get_recent_alerts
+from services.market_data import build_market_overview
 
 logger = logging.getLogger(__name__)
 
@@ -309,6 +303,20 @@ def _append_alert_history(new_alerts: list, max_items: int = 50) -> None:
     st.session_state["alerts"] = history[-max_items:]
 
 
+def _ibkr_total_value_for_alerts() -> Optional[float]:
+    """Latest ``total_value`` from synced snapshots for alert evaluation (read-only)."""
+    try:
+        df = get_latest_portfolio_snapshot()
+        if df is None or df.empty:
+            return None
+        v = float(pd.to_numeric(df.iloc[0].get("total_value"), errors="coerce"))
+        if math.isfinite(v):
+            return v
+    except Exception:
+        logger.exception("Failed to read IBKR portfolio total for alerts.")
+    return None
+
+
 def _evaluate_alerts_safely(market_df: pd.DataFrame, portfolio_value: Optional[float]) -> None:
     """Evaluate alert engine using current dashboard data without crashing UI."""
     required_columns = {"Symbol", "Drawdown from ATH %", "Price"}
@@ -420,153 +428,62 @@ def render_market_overview() -> pd.DataFrame:
     return overview_df
 
 
-def _portfolio_input_table(default_rows: int = 3) -> pd.DataFrame:
-    """Render editable portfolio input grid."""
-    initial_df = pd.DataFrame(
-        {
-            "Ticker": [""] * default_rows,
-            "Quantity": [0.0] * default_rows,
-            "Avg Buy Price": [0.0] * default_rows,
-        }
-    )
-    return st.data_editor(
-        initial_df,
-        num_rows="dynamic",
-        width="stretch",
-        hide_index=True,
-        column_config={
-            "Ticker": st.column_config.TextColumn("Ticker", help="Example: SPY"),
-            "Quantity": st.column_config.NumberColumn("Quantity", min_value=0.0, step=1.0),
-            "Avg Buy Price": st.column_config.NumberColumn("Avg Buy Price", min_value=0.0, step=0.01),
-        },
-    )
+def _format_portfolio_eur(value: float) -> str:
+    """Format amount as ``1,234.56 €`` (2 decimals, comma thousands)."""
+    return f"{round(value, 2):,.2f} €"
 
 
-def _validate_portfolio_rows(portfolio_df: pd.DataFrame) -> pd.DataFrame:
-    """Keep rows with valid ticker, quantity, and average buy price."""
-    cleaned = portfolio_df.copy()
-    cleaned["Ticker"] = cleaned["Ticker"].astype(str).str.strip().str.upper()
-    cleaned = cleaned[cleaned["Ticker"] != ""]
-    cleaned = cleaned[(cleaned["Quantity"] > 0) & (cleaned["Avg Buy Price"] > 0)]
-    return cleaned
+def _portfolio_alloc_pct(part: float, total: float) -> float:
+    """Return ``part / total * 100`` rounded to 1 decimal; 0 if invalid or ``total == 0``."""
+    if total == 0 or not math.isfinite(total):
+        return 0.0
+    if not math.isfinite(part):
+        return 0.0
+    return round(part / total * 100, 1)
 
 
-def render_portfolio_section() -> Optional[float]:
-    """Render manual portfolio editor and computed portfolio metrics."""
-    st.subheader("Portfolio")
-    st.caption("Edits here apply for this session only.")
-    if not st.session_state.get("_portfolio_has_holdings", False):
-        st.info("No holdings yet — add your first position below.")
-    portfolio_input = _portfolio_input_table()
-    cleaned_portfolio = _validate_portfolio_rows(portfolio_input)
+def render_portfolio_overview() -> None:
+    """Show latest synced portfolio totals and allocation from ``portfolio_snapshots``."""
+    st.markdown("### 💼 Portfolio Overview")
+    try:
+        df = get_latest_portfolio_snapshot()
+    except Exception:
+        logger.exception("Failed to load latest portfolio snapshot.")
+        st.info("No portfolio data yet")
+        return
 
-    if cleaned_portfolio.empty:
-        st.session_state["_portfolio_has_holdings"] = False
-        return None
-    st.session_state["_portfolio_has_holdings"] = True
+    if df is None or df.empty:
+        st.info("No portfolio data yet")
+        return
 
-    unique_tickers = cleaned_portfolio["Ticker"].dropna().unique().tolist()
-    latest_prices = get_latest_price_map(unique_tickers)
+    row = df.iloc[0]
+    total = float(pd.to_numeric(row.get("total_value"), errors="coerce"))
+    vwce = float(pd.to_numeric(row.get("vwce_value"), errors="coerce"))
+    cndx = float(pd.to_numeric(row.get("cndx_value"), errors="coerce"))
+    cash = float(pd.to_numeric(row.get("cash"), errors="coerce"))
 
-    portfolio_rows: List[Dict[str, object]] = []
-    missing_tickers: List[str] = []
+    if any(not math.isfinite(x) for x in (total, vwce, cndx, cash)):
+        st.info("No portfolio data yet")
+        return
 
-    for _, row in cleaned_portfolio.iterrows():
-        ticker = row["Ticker"]
-        quantity = float(row["Quantity"])
-        avg_buy_price = float(row["Avg Buy Price"])
-        current_price = latest_prices.get(ticker)
+    vwce_pct = _portfolio_alloc_pct(vwce, total)
+    cndx_pct = _portfolio_alloc_pct(cndx, total)
+    cash_pct = _portfolio_alloc_pct(cash, total)
 
-        if current_price is None:
-            logger.info("Portfolio ticker has no market price: %s", ticker)
-            missing_tickers.append(ticker)
-            portfolio_rows.append(
-                {
-                    "Ticker": ticker,
-                    "Quantity": quantity,
-                    "Avg Buy Price": avg_buy_price,
-                    "Current Price": None,
-                    "Cost Basis": calculate_cost_basis(quantity, avg_buy_price),
-                    "Current Value": None,
-                    "Unrealized PnL": None,
-                    "Unrealized PnL %": None,
-                }
-            )
-            continue
-
-        market_value = calculate_market_value(quantity, current_price)
-        cost_basis = calculate_cost_basis(quantity, avg_buy_price)
-        pnl = calculate_unrealized_pnl(market_value, cost_basis)
-        pnl_pct = calculate_unrealized_pnl_percent(pnl, cost_basis)
-
-        portfolio_rows.append(
-            {
-                "Ticker": ticker,
-                "Quantity": quantity,
-                "Avg Buy Price": avg_buy_price,
-                "Current Price": current_price,
-                "Cost Basis": cost_basis,
-                "Current Value": market_value,
-                "Unrealized PnL": pnl,
-                "Unrealized PnL %": pnl_pct,
-            }
-        )
-
-    if missing_tickers:
-        tickers_text = ", ".join(sorted(set(missing_tickers)))
-        st.warning(f"No live price for: {tickers_text}. Check the ticker or try again later.")
-
-    result_df = pd.DataFrame(portfolio_rows)
-
-    totals_df = result_df.dropna(subset=["Cost Basis", "Current Value", "Unrealized PnL"])
-    if totals_df.empty:
-        with st.expander("Holdings", expanded=False):
-            st.dataframe(
-                result_df,
-                width="stretch",
-                hide_index=True,
-                column_config={
-                    "Quantity": st.column_config.NumberColumn("Quantity", format="%.4f"),
-                    "Avg Buy Price": st.column_config.NumberColumn("Avg Buy Price", format="%.2f"),
-                    "Current Price": st.column_config.NumberColumn("Current Price", format="%.2f"),
-                    "Cost Basis": st.column_config.NumberColumn("Cost Basis", format="%.2f"),
-                    "Current Value": st.column_config.NumberColumn("Current Value", format="%.2f"),
-                    "Unrealized PnL": st.column_config.NumberColumn("Unrealized PnL", format="%.2f"),
-                    "Unrealized PnL %": st.column_config.NumberColumn("Unrealized PnL %", format="%.2f%%"),
-                },
-            )
-        return None
-
-    total_cost_basis = totals_df["Cost Basis"].sum()
-    total_current_value = totals_df["Current Value"].sum()
-    total_pnl = totals_df["Unrealized PnL"].sum()
-    total_pnl_pct = calculate_unrealized_pnl_percent(total_pnl, total_cost_basis)
-
-    st.markdown("")
-    c1, c2 = st.columns(2)
-    c1.metric("Portfolio value", format_price(total_current_value), delta=float(total_pnl))
-    c2.metric("Total return", format_percent(total_pnl_pct))
-    st.markdown("")
-    c3, c4 = st.columns(2)
-    c3.metric("Cost basis", format_price(total_cost_basis))
-    c4.metric("Unrealized gain / loss", format_price(total_pnl))
-
-    with st.expander("Holdings", expanded=False):
-        st.dataframe(
-            result_df,
-            width="stretch",
-            hide_index=True,
-            column_config={
-                "Quantity": st.column_config.NumberColumn("Quantity", format="%.4f"),
-                "Avg Buy Price": st.column_config.NumberColumn("Avg Buy Price", format="%.2f"),
-                "Current Price": st.column_config.NumberColumn("Current Price", format="%.2f"),
-                "Cost Basis": st.column_config.NumberColumn("Cost Basis", format="%.2f"),
-                "Current Value": st.column_config.NumberColumn("Current Value", format="%.2f"),
-                "Unrealized PnL": st.column_config.NumberColumn("Unrealized PnL", format="%.2f"),
-                "Unrealized PnL %": st.column_config.NumberColumn("Unrealized PnL %", format="%.2f%%"),
-            },
-        )
-    return total_current_value
+    st.metric("Total Value", _format_portfolio_eur(total))
+    st.write("")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("VWCE", _format_portfolio_eur(vwce))
+        st.caption(f"{vwce_pct:.1f}% of portfolio")
+    with col2:
+        st.metric("CNDX", _format_portfolio_eur(cndx))
+        st.caption(f"{cndx_pct:.1f}% of portfolio")
+    with col3:
+        st.metric("Cash", _format_portfolio_eur(cash))
+        st.caption(f"{cash_pct:.1f}% of portfolio")
+        st.caption("Uninvested")
+    st.write("")
 
 
 def render_portfolio_performance_section() -> None:
@@ -673,8 +590,11 @@ def render_dashboard() -> None:
     with st.container():
         _render_investment_hero(market_df)
 
-    # Refresh market-based alerts before rendering the alert section.
-    _evaluate_alerts_safely(market_df=market_df, portfolio_value=None)
+    # Alerts use IBKR-synced total from DB when available (same source as Portfolio Overview).
+    _evaluate_alerts_safely(
+        market_df=market_df,
+        portfolio_value=_ibkr_total_value_for_alerts(),
+    )
 
     st.divider()
 
@@ -684,11 +604,9 @@ def render_dashboard() -> None:
 
     st.divider()
 
-    # 3) Portfolio
+    # 3) Synced portfolio overview (DB snapshots; IBKR)
     with st.container():
-        portfolio_total_value = render_portfolio_section()
-
-    _evaluate_alerts_safely(market_df=market_df, portfolio_value=portfolio_total_value)
+        render_portfolio_overview()
 
     st.divider()
 

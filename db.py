@@ -68,6 +68,16 @@ def init_db() -> None:
             conn = c
             c.row_factory = sqlite3.Row
             c.executescript(SCHEMA_SQL)
+            try:
+                c.execute("ALTER TABLE portfolio_snapshots ADD COLUMN raw_positions TEXT")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    raise
+            try:
+                c.execute("ALTER TABLE portfolio_snapshots ADD COLUMN raw_xml TEXT")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    raise
     finally:
         if conn is not None:
             conn.close()
@@ -175,6 +185,28 @@ def get_portfolio_history(days: int = 30) -> pd.DataFrame:
             """,
             conn,
             params=(cutoff,),
+        )
+    except Exception:
+        logger.error("DB query failed", exc_info=True)
+        return pd.DataFrame()
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def get_latest_portfolio_snapshot() -> pd.DataFrame:
+    """Return the newest ``portfolio_snapshots`` row (at most one), or empty."""
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = get_connection()
+        return pd.read_sql_query(
+            """
+            SELECT *
+            FROM portfolio_snapshots
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            conn,
         )
     except Exception:
         logger.error("DB query failed", exc_info=True)

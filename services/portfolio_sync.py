@@ -1,0 +1,171 @@
+"""Daily IBKR portfolio sync to SQLite."""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List
+
+import db
+from services.ibkr_flex import fetch_flex_report, parse_flex_report, request_flex_report
+
+import logging
+logging.basicConfig(level=logging.INFO)
+
+logger = logging.getLogger(__name__)
+
+_STATE_PATH = Path(__file__).resolve().parent.parent / "data" / "ibkr_sync_state.json"
+SYMBOL_MAPPING = {
+    "SXRV": "CNDX",
+}
+
+
+def _write_state_atomic(path: Path, data: Dict[str, Any]) -> None:
+    path = Path(path)
+    with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8", dir=str(path.parent)) as tmp:
+        json.dump(data, tmp, indent=2)
+        tmp_path = tmp.name
+    os.replace(tmp_path, str(path))
+
+
+def _safe_float(value: Any) -> float:
+    try:
+        if value is None:
+            return 0.0
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _load_sync_state() -> Dict[str, Any]:
+    if not _STATE_PATH.exists():
+        return {}
+    try:
+        with _STATE_PATH.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+        return payload if isinstance(payload, dict) else {}
+    except Exception as exc:
+        logger.warning("Failed to load IBKR sync state: %s", exc)
+        return {}
+
+
+def _save_sync_state(payload: Dict[str, Any]) -> None:
+    try:
+        _STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _write_state_atomic(_STATE_PATH, payload)
+    except Exception as exc:
+        logger.error("Failed to save IBKR sync state: %s", exc)
+
+
+def should_sync_today() -> bool:
+    """Return True once per UTC day based on sync state file."""
+    try:
+        state = _load_sync_state()
+        last_sync_date = str(state.get("last_sync_date", "")).strip()
+        today_utc = datetime.now(timezone.utc).date().isoformat()
+        return last_sync_date != today_utc
+    except Exception as exc:
+        logger.error("should_sync_today failed: %s", exc)
+        # Fail-open to keep sync deterministic and self-healing.
+        return True
+
+
+def calculate_portfolio_summary(parsed_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Build VWCE/CNDX/cash/total summary and raw positions JSON string."""
+    positions: List[Dict[str, Any]] = parsed_data.get("positions", [])
+    cash_balances: List[Dict[str, Any]] = parsed_data.get("cash_balances", [])
+
+    vwce_value = 0.0
+    cndx_value = 0.0
+    for position in positions:
+        raw_symbol = position.get("symbol")
+        symbol = SYMBOL_MAPPING.get(raw_symbol, raw_symbol)
+        market_value = _safe_float(position.get("market_value"))
+        if symbol == "VWCE":
+            vwce_value += market_value
+        elif symbol == "CNDX":
+            cndx_value += market_value
+
+    cash = 0.0
+    for balance in cash_balances:
+        cash += _safe_float(balance.get("balance"))
+
+    total_value = _safe_float(parsed_data.get("net_liquidation_value"))
+    if total_value == 0.0:
+        total_value = sum(_safe_float(p.get("market_value")) for p in positions) + cash
+
+    return {
+        "total_value": total_value,
+        "vwce_value": vwce_value,
+        "cndx_value": cndx_value,
+        "cash": cash,
+        "raw_positions": json.dumps(positions, ensure_ascii=True, default=str),
+    }
+
+
+def run_portfolio_sync() -> None:
+    """Run one IBKR sync cycle and persist portfolio snapshot safely."""
+    try:
+        if not should_sync_today():
+            logger.info("IBKR sync skipped: already synced today")
+            return
+
+        reference_code = request_flex_report()
+        raw_xml = fetch_flex_report(reference_code)
+        parsed_data = parse_flex_report(raw_xml)
+        positions = parsed_data.get("positions", [])
+        logger.info("IBKR positions count=%d", len(positions))
+        summary = calculate_portfolio_summary(parsed_data)
+
+        # Round financial values to 2 decimals to avoid float artifacts
+        total_value = round(_safe_float(summary.get("total_value")), 2)
+        vwce_value = round(_safe_float(summary.get("vwce_value")), 2)
+        cndx_value = round(_safe_float(summary.get("cndx_value")), 2)
+        cash = round(_safe_float(summary.get("cash")), 2)
+
+        timestamp = datetime.now(timezone.utc).isoformat()
+        conn = db.get_connection()
+        try:
+            conn.execute(
+                """
+                INSERT INTO portfolio_snapshots
+                    (timestamp, total_value, vwce_value, cndx_value, cash, raw_positions, raw_xml)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    timestamp,
+                    total_value,
+                    vwce_value,
+                    cndx_value,
+                    cash,
+                    summary["raw_positions"],
+                    raw_xml,
+                ),
+            )
+            conn.commit()
+            today_utc = datetime.now(timezone.utc).date().isoformat()
+            _save_sync_state(
+                {
+                    "last_sync_date": today_utc,
+                    "last_sync_timestamp": timestamp,
+                }
+            )
+        finally:
+            conn.close()
+
+        logger.info(
+            "IBKR sync SUCCESS: total=%.2f vwce=%.2f cndx=%.2f cash=%.2f",
+            total_value,
+            vwce_value,
+            cndx_value,
+            cash,
+        )
+    except Exception as exc:
+        logger.error("IBKR sync failed: %s", exc, exc_info=True)
+
+if __name__ == "__main__":
+    run_portfolio_sync()
