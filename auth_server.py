@@ -309,6 +309,9 @@ async def _proxy_websocket(client_ws: WebSocket, path: str) -> None:
     async with websockets.connect(
         upstream_url,
         origin=STREAMLIT_ORIGIN,
+        extra_headers=[
+            ("Host", "app:8501"),
+        ],
         ping_interval=None,
     ) as upstream_ws:
 
