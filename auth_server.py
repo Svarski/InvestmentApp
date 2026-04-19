@@ -18,6 +18,10 @@ import websockets
 from fastapi import FastAPI, Form, Request, Response, WebSocket, status
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
+
+from dotenv import load_dotenv
+load_dotenv()
+
 # --- Configuration (env only; never hardcode secrets) ---
 
 SESSION_COOKIE_NAME = os.getenv("AUTH_SESSION_COOKIE", "app_session")
