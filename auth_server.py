@@ -253,7 +253,7 @@ async def _proxy_http(request: Request, path: str) -> Response:
     url = _upstream_http_url(path, request.url.query)
     body = await request.body()
     #headers = forward_request_headers(request)
-
+    headers = dict(request.headers) 
     req = client.build_request(request.method, url, headers=headers, content=body)
     try:
         response = await client.send(req, stream=True)
