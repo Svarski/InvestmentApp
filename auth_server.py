@@ -252,8 +252,8 @@ async def _proxy_http(request: Request, path: str) -> Response:
     client: httpx.AsyncClient = request.app.state.http
     url = _upstream_http_url(path, request.url.query)
     body = await request.body()
-    #headers = forward_request_headers(request)
-    headers = dict(request.headers) 
+    headers = forward_request_headers(request)
+
     req = client.build_request(request.method, url, headers=headers, content=body)
     try:
         response = await client.send(req, stream=True)
@@ -302,34 +302,41 @@ def _ws_session_ok(websocket: WebSocket) -> bool:
     return websocket.cookies.get(SESSION_COOKIE_NAME) == SESSION_COOKIE_VALUE
 
 
-async def _proxy_websocket(client_ws, path: str):
-    upstream_url = f"ws://app:8501{path}"
+async def _proxy_websocket(client_ws: WebSocket, path: str) -> None:
+    query_string = client_ws.scope.get("query_string", b"")
+    upstream_url = _upstream_ws_url(path, query_string)
 
     async with websockets.connect(
         upstream_url,
         extra_headers={
-            "Origin": "http://app:8501",
+            "Origin": STREAMLIT_ORIGIN,
         },
         ping_interval=None,
     ) as upstream_ws:
 
-        async def from_client():
+        async def client_to_upstream():
             try:
-                async for msg in client_ws.iter_text():
+                while True:
+                    msg = await client_ws.receive_text()
                     await upstream_ws.send(msg)
             except Exception:
                 pass
 
-        async def from_upstream():
+        async def upstream_to_client():
             try:
                 async for msg in upstream_ws:
                     await client_ws.send_text(msg)
             except Exception:
                 pass
 
-        await asyncio.gather(from_client(), from_upstream())
+        await asyncio.gather(client_to_upstream(), upstream_to_client())
 
 
 @app.websocket("/{path:path}")
 async def websocket_proxy(websocket: WebSocket, path: str) -> None:
+    if not _ws_session_ok(websocket):
+        await websocket.close(code=1008)
+        return
+
+    await websocket.accept()
     await _proxy_websocket(websocket, path)
