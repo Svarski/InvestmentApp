@@ -187,14 +187,13 @@ async def login_get(request: Request) -> Response:
     if not credentials_configured():
         err = "Login is not configured (set APP_USERNAME and APP_PASSWORD)."
     return templates.TemplateResponse(
-    name="login.html",
-    request=request,
-    context={
-        "request": request,
-        "error": err,
-    },
-    status_code=status.HTTP_200_OK,
-)
+        "login.html",
+        {
+            "request": request,
+            "error": err,
+        },
+        status_code=status.HTTP_200_OK,
+    )
 
 
 @app.post("/login")
@@ -205,9 +204,8 @@ async def login_post(
 ) -> Response:
     if not credentials_configured():
         return templates.TemplateResponse(
-            name="login.html",
-            request=request,
-            context={
+            "login.html",
+            {
                 "request": request,
                 "error": "Login is not configured (set APP_USERNAME and APP_PASSWORD).",
             },
@@ -216,9 +214,8 @@ async def login_post(
 
     if not verify_credentials(username.strip(), password):
         return templates.TemplateResponse(
-            name="login.html",
-            request=request,
-            context={
+            "login.html",
+            {
                 "request": request,
                 "error": "Invalid username or password.",
             },

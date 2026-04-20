@@ -10,9 +10,10 @@ git push
 ssh root@178.104.129.99
 cd ~/investmentapp
 git reset --hard
-git pull
+
 docker compose down
-docker compose up -d --build auth
+git pull
+docker compose up -d --build
 
 Simple Streamlit MVP for tracking core market instruments and a manually entered portfolio.
 
