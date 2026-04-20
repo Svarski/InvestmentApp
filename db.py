@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS alerts (
 );
 
 CREATE TABLE IF NOT EXISTS portfolio_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp TEXT NOT NULL,
     total_value REAL NOT NULL,
     vwce_value REAL NOT NULL,
@@ -45,6 +46,74 @@ CREATE INDEX IF NOT EXISTS idx_alerts_timestamp ON alerts(timestamp);
 CREATE INDEX IF NOT EXISTS idx_alerts_symbol ON alerts(symbol);
 CREATE INDEX IF NOT EXISTS idx_portfolio_timestamp ON portfolio_snapshots(timestamp);
 """
+
+
+def _table_has_primary_key_column(conn: sqlite3.Connection, table_name: str, column_name: str) -> bool:
+    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    for row in rows:
+        if row["name"] == column_name and int(row["pk"]) == 1:
+            return True
+    return False
+
+
+def _table_has_column(conn: sqlite3.Connection, table_name: str, column_name: str) -> bool:
+    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    return any(row["name"] == column_name for row in rows)
+
+
+def _migrate_portfolio_snapshots_primary_key(conn: sqlite3.Connection) -> None:
+    """Ensure portfolio_snapshots has id INTEGER PRIMARY KEY AUTOINCREMENT.
+
+    SQLite cannot add a PK column via ALTER TABLE, so we rebuild table safely.
+    """
+    if _table_has_primary_key_column(conn, "portfolio_snapshots", "id"):
+        return
+
+    logger.info("DB migration: portfolio_snapshots missing PK id; starting safe table rebuild")
+    with conn:
+        conn.execute(
+            """
+            CREATE TABLE portfolio_snapshots_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                total_value REAL NOT NULL,
+                vwce_value REAL NOT NULL,
+                cndx_value REAL NOT NULL,
+                cash REAL NOT NULL,
+                raw_positions TEXT,
+                raw_xml TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO portfolio_snapshots_new
+                (timestamp, total_value, vwce_value, cndx_value, cash, raw_positions, raw_xml)
+            SELECT
+                timestamp,
+                total_value,
+                vwce_value,
+                cndx_value,
+                cash,
+                raw_positions,
+                raw_xml
+            FROM portfolio_snapshots
+            """
+        )
+        conn.execute("DROP TABLE portfolio_snapshots")
+        conn.execute("ALTER TABLE portfolio_snapshots_new RENAME TO portfolio_snapshots")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_portfolio_timestamp ON portfolio_snapshots(timestamp)")
+
+    if not _validate_portfolio_snapshots_schema(conn):
+        raise RuntimeError("portfolio_snapshots schema validation failed after PK migration")
+    logger.info("DB migration: portfolio_snapshots PK migration completed successfully")
+
+
+def _validate_portfolio_snapshots_schema(conn: sqlite3.Connection) -> bool:
+    """Return True if portfolio_snapshots has id INTEGER PRIMARY KEY."""
+    return _table_has_column(conn, "portfolio_snapshots", "id") and _table_has_primary_key_column(
+        conn, "portfolio_snapshots", "id"
+    )
 
 
 def get_connection() -> sqlite3.Connection:
@@ -78,6 +147,20 @@ def init_db() -> None:
             except sqlite3.OperationalError as exc:
                 if "duplicate column name" not in str(exc).lower():
                     raise
+            try:
+                if not _table_has_column(c, "portfolio_snapshots", "id") or not _table_has_primary_key_column(
+                    c, "portfolio_snapshots", "id"
+                ):
+                    _migrate_portfolio_snapshots_primary_key(c)
+            except Exception as exc:
+                logger.critical(
+                    "CRITICAL: portfolio_snapshots migration failed - DB is in legacy state",
+                    exc_info=True,
+                )
+            if not _validate_portfolio_snapshots_schema(c):
+                logger.error(
+                    "portfolio_snapshots schema validation failed: missing id INTEGER PRIMARY KEY; database remains in legacy state"
+                )
     finally:
         if conn is not None:
             conn.close()

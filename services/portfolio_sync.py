@@ -13,7 +13,6 @@ from typing import Any, Dict, List
 import db
 from services.ibkr_flex import fetch_flex_report, parse_flex_report, request_flex_report
 
-import logging
 logging.basicConfig(level=logging.INFO)
 
 logger = logging.getLogger(__name__)

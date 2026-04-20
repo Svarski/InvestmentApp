@@ -159,6 +159,7 @@ Evaluates market conditions and decides when to trigger alerts.
 
 #### portfolio_snapshots
 
+* id (INTEGER PRIMARY KEY AUTOINCREMENT)
 * timestamp
 * total_value
 * vwce_value
@@ -300,6 +301,11 @@ Important:
 * independent system
 * uses its own state
 * not tied to real-time alerts
+* module split:
+  * `services/reports/weekly_digest.py` (orchestrator, backward-compatible API)
+  * `services/reports/weekly_digest_state.py` (state + JSON persistence)
+  * `services/reports/weekly_digest_scheduler.py` (weekly send scheduling)
+  * `services/reports/weekly_digest_builder.py` (HTML/text digest generation)
 
 ---
 
