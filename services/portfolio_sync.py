@@ -195,30 +195,49 @@ def run_portfolio_sync() -> None:
 
         _update_portfolio_sync_state_in_progress(_utc_now_iso_z())
         reference_code = ""
-        max_attempts = 3
-        for attempt in range(1, max_attempts + 1):
+        request_start_ts = time.monotonic()
+        request_max_duration_seconds = 120
+        request_attempt = 0
+        while (time.monotonic() - request_start_ts) < request_max_duration_seconds:
+            request_attempt += 1
             try:
                 reference_code = request_flex_report()
-                logger.info("IBKR Flex request succeeded on attempt %s", attempt)
+                elapsed_success = int(time.monotonic() - request_start_ts)
+                logger.info("IBKR Flex request succeeded after %ss", elapsed_success)
                 break
             except (ReadTimeout, RequestsConnectionError) as exc:
                 message = str(exc)
-                if attempt < max_attempts:
-                    delay_seconds = attempt * 5
-                    logger.warning(
-                        "IBKR Flex request network error. Retrying... attempt=%s/%s delay=%ss error=%s",
-                        attempt,
-                        max_attempts,
-                        delay_seconds,
-                        message,
+                delay_seconds = request_attempt * 5
+                elapsed = int(time.monotonic() - request_start_ts)
+                remaining = request_max_duration_seconds - elapsed
+                if remaining <= 0:
+                    break
+                sleep_for = min(delay_seconds, remaining)
+                logger.warning(
+                    "IBKR Flex request network error. Retrying... attempt=%s delay=%ss error=%s",
+                    request_attempt,
+                    sleep_for,
+                    message,
+                )
+                time.sleep(sleep_for)
+                continue
+            except Exception as exc:
+                message = str(exc)
+                if "[1001]" in message:
+                    elapsed = int(time.monotonic() - request_start_ts)
+                    remaining = request_max_duration_seconds - elapsed
+                    if remaining <= 0:
+                        break
+                    sleep_for = min(5, remaining)
+                    logger.info(
+                        "IBKR Flex request not ready (1001). Retrying... elapsed=%ss",
+                        elapsed,
                     )
-                    time.sleep(delay_seconds)
+                    time.sleep(sleep_for)
                     continue
                 raise
-            except Exception:
-                raise
         if not reference_code:
-            raise Exception("IBKR Flex request failed after retries")
+            raise Exception("IBKR Flex request not ready after retry window")
         logger.info("IBKR Flex report requested. reference_code=%s", reference_code)
 
         raw_xml = ""
