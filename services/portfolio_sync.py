@@ -140,6 +140,89 @@ def _utc_now_iso_z() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def _request_flex_report_with_backoff() -> str:
+    """Request Flex report with slow, bounded retries."""
+    max_attempts = 3
+    delay_between_attempts_seconds = 60
+    logger.info("Starting IBKR Flex request phase")
+    for attempt in range(1, max_attempts + 1):
+        try:
+            reference_code = request_flex_report()
+            if not reference_code:
+                raise Exception("IBKR Flex request failed: no reference_code returned")
+            logger.info("IBKR Flex request succeeded. reference_code=%s", reference_code)
+            return reference_code
+        except (ReadTimeout, RequestsConnectionError) as exc:
+            if attempt >= max_attempts:
+                raise
+            logger.warning(
+                "IBKR Flex request network error. Waiting %ss before retry... attempt=%s/%s error=%s",
+                delay_between_attempts_seconds,
+                attempt,
+                max_attempts,
+                str(exc),
+            )
+            time.sleep(delay_between_attempts_seconds)
+        except Exception as exc:
+            message = str(exc)
+            if "[1018]" in message:
+                raise Exception("IBKR Flex rate limited (1018). Will retry on next scheduled cycle.")
+            if "[1001]" in message:
+                if attempt >= max_attempts:
+                    raise Exception("IBKR Flex request not ready (1001) after request retry limit.")
+                logger.info(
+                    "IBKR Flex request not ready (1001). Waiting %ss before retry... attempt=%s/%s",
+                    delay_between_attempts_seconds,
+                    attempt,
+                    max_attempts,
+                )
+                time.sleep(delay_between_attempts_seconds)
+                continue
+            raise
+    raise Exception("IBKR Flex request failed after bounded retries")
+
+
+def _poll_flex_report(reference_code: str) -> str:
+    """Poll Flex report fetch endpoint using an existing reference code."""
+    raw_xml = ""
+    start_ts = time.monotonic()
+    max_duration_seconds = 300
+    poll_interval_seconds = 10
+    attempt = 0
+    last_error_message = None
+    logger.info("Starting IBKR Flex polling. reference_code=%s", reference_code)
+    while (time.monotonic() - start_ts) < max_duration_seconds:
+        attempt += 1
+        try:
+            raw_xml = fetch_flex_report(reference_code)
+            total_elapsed = int(time.monotonic() - start_ts)
+            logger.info("IBKR Flex report fetched successfully after %ss", total_elapsed)
+            return raw_xml
+        except Exception as exc:
+            message = str(exc)
+            last_error_message = message
+            lower_msg = message.lower()
+            if "[1001]" not in message and "not ready" not in lower_msg:
+                raise
+
+            elapsed = int(time.monotonic() - start_ts)
+            remaining = max_duration_seconds - elapsed
+            if remaining <= 0:
+                break
+            sleep_for = min(poll_interval_seconds, remaining)
+            logger.info(
+                "IBKR Flex report not ready yet. polling attempt=%s elapsed=%ss next_delay=%ss",
+                attempt,
+                elapsed,
+                sleep_for,
+            )
+            time.sleep(sleep_for)
+
+    raise Exception(
+        f"IBKR Flex report not ready after polling window (5 minutes). Last error: {last_error_message}"
+    )
+
+
 def should_sync_today() -> bool:
     """Return True once per UTC day based on sync state file."""
     try:
@@ -194,89 +277,8 @@ def run_portfolio_sync() -> None:
             return
 
         _update_portfolio_sync_state_in_progress(_utc_now_iso_z())
-        reference_code = ""
-        request_start_ts = time.monotonic()
-        request_max_duration_seconds = 120
-        request_attempt = 0
-        while (time.monotonic() - request_start_ts) < request_max_duration_seconds:
-            request_attempt += 1
-            try:
-                reference_code = request_flex_report()
-                elapsed_success = int(time.monotonic() - request_start_ts)
-                logger.info("IBKR Flex request succeeded after %ss", elapsed_success)
-                break
-            except (ReadTimeout, RequestsConnectionError) as exc:
-                message = str(exc)
-                delay_seconds = request_attempt * 5
-                elapsed = int(time.monotonic() - request_start_ts)
-                remaining = request_max_duration_seconds - elapsed
-                if remaining <= 0:
-                    break
-                sleep_for = min(delay_seconds, remaining)
-                logger.warning(
-                    "IBKR Flex request network error. Retrying... attempt=%s delay=%ss error=%s",
-                    request_attempt,
-                    sleep_for,
-                    message,
-                )
-                time.sleep(sleep_for)
-                continue
-            except Exception as exc:
-                message = str(exc)
-                if "[1001]" in message:
-                    elapsed = int(time.monotonic() - request_start_ts)
-                    remaining = request_max_duration_seconds - elapsed
-                    if remaining <= 0:
-                        break
-                    sleep_for = min(5, remaining)
-                    logger.info(
-                        "IBKR Flex request not ready (1001). Retrying... elapsed=%ss",
-                        elapsed,
-                    )
-                    time.sleep(sleep_for)
-                    continue
-                raise
-        if not reference_code:
-            raise Exception("IBKR Flex request not ready after retry window")
-        logger.info("IBKR Flex report requested. reference_code=%s", reference_code)
-
-        raw_xml = ""
-        start_ts = time.monotonic()
-        max_duration_seconds = 300
-        attempt = 0
-        last_error_message = None
-        logger.info("Starting IBKR Flex polling (max 300s)")
-        while (time.monotonic() - start_ts) < max_duration_seconds:
-            attempt += 1
-            try:
-                raw_xml = fetch_flex_report(reference_code)
-                total_elapsed = int(time.monotonic() - start_ts)
-                logger.info("IBKR Flex report fetched successfully after %ss", total_elapsed)
-                break
-            except Exception as exc:
-                message = str(exc)
-                last_error_message = message
-                if "[1001]" not in message:
-                    raise
-
-                elapsed = int(time.monotonic() - start_ts)
-                delay_seconds = min(5 * attempt, 30)
-                remaining = max_duration_seconds - elapsed
-                if remaining <= 0:
-                    break
-                sleep_for = min(delay_seconds, remaining)
-                logger.info(
-                    "IBKR Flex polling... attempt=%s elapsed=%ss next_delay=%ss",
-                    attempt,
-                    elapsed,
-                    sleep_for,
-                )
-                time.sleep(sleep_for)
-
-        if not raw_xml:
-            raise Exception(
-                f"IBKR Flex report not ready after polling window (5 minutes). Last error: {last_error_message}"
-            )
+        reference_code = _request_flex_report_with_backoff()
+        raw_xml = _poll_flex_report(reference_code)
         parsed_data = parse_flex_report(raw_xml)
         positions = parsed_data.get("positions", [])
         logger.info("IBKR positions count=%d", len(positions))

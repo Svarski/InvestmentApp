@@ -15,8 +15,16 @@ run_portfolio_sync()
 ## Flow
 
 1. preveri should_sync_today()
-2. request_flex_report()
-3. fetch_flex_report()
+2. request phase: `_request_flex_report_with_backoff()`
+   - max 3 poskusi
+   - 60s razmik med requesti
+   - `[1001]` -> pocaka 60s in retry
+   - network error -> pocaka 60s in retry
+   - `[1018]` -> fail-fast (next worker cycle bo poskusil znova)
+3. polling phase: `_poll_flex_report(reference_code)`
+   - uporablja isti `reference_code` (ne ustvarja novega joba)
+   - polling vsakih 10s, max 5 minut
+   - ce report ni ready (`[1001]` / "not ready"), nadaljuje polling
 4. parse_flex_report()
 5. calculate_portfolio_summary()
 6. insert v DB
@@ -79,7 +87,9 @@ Vedno shrani:
 
 - try/except na celotnem flowu
 - DB error ne crasha workerja
-- state update samo ob uspehu
+- state update: `in_progress` -> `success` / `failed`
+- `last_successful_sync` se ohrani ob `in_progress` in `failed`
+- snapshot se NE zapise, ce `total_value <= 0`
 
 ---
 
