@@ -18,6 +18,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 _STATE_PATH = Path(__file__).resolve().parent.parent / "data" / "ibkr_sync_state.json"
+_PORTFOLIO_SYNC_STATE_PATH = Path(__file__).resolve().parent.parent / "data" / "portfolio_sync_state.json"
 SYMBOL_MAPPING = {
     "SXRV": "CNDX",
 }
@@ -58,6 +59,67 @@ def _save_sync_state(payload: Dict[str, Any]) -> None:
         _write_state_atomic(_STATE_PATH, payload)
     except Exception as exc:
         logger.error("Failed to save IBKR sync state: %s", exc)
+
+
+def load_portfolio_sync_state() -> Dict[str, Any]:
+    """Read sync health state for UI/monitoring with safe defaults."""
+    defaults: Dict[str, Any] = {
+        "last_successful_sync": None,
+        "last_attempt": None,
+        "status": "unknown",
+        "error": None,
+    }
+    if not _PORTFOLIO_SYNC_STATE_PATH.exists():
+        return defaults
+    try:
+        with _PORTFOLIO_SYNC_STATE_PATH.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if not isinstance(payload, dict):
+            return defaults
+        return {
+            "last_successful_sync": payload.get("last_successful_sync"),
+            "last_attempt": payload.get("last_attempt"),
+            "status": str(payload.get("status") or "unknown"),
+            "error": payload.get("error"),
+        }
+    except Exception as exc:
+        logger.warning("Failed to load portfolio sync state: %s", exc)
+        return defaults
+
+
+def _save_portfolio_sync_state(payload: Dict[str, Any]) -> None:
+    """Persist sync health state atomically; never raises."""
+    try:
+        _PORTFOLIO_SYNC_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _write_state_atomic(_PORTFOLIO_SYNC_STATE_PATH, payload)
+    except Exception as exc:
+        logger.error("Failed to save portfolio sync state: %s", exc)
+
+
+def _update_portfolio_sync_state_success(now_iso: str) -> None:
+    _save_portfolio_sync_state(
+        {
+            "last_successful_sync": now_iso,
+            "last_attempt": now_iso,
+            "status": "success",
+            "error": None,
+        }
+    )
+
+
+def _update_portfolio_sync_state_failed(now_iso: str, error_message: str) -> None:
+    short_error = (error_message or "Unknown error").strip()
+    if len(short_error) > 200:
+        short_error = short_error[:197] + "..."
+    existing = load_portfolio_sync_state()
+    _save_portfolio_sync_state(
+        {
+            "last_successful_sync": existing.get("last_successful_sync"),
+            "last_attempt": now_iso,
+            "status": "failed",
+            "error": short_error,
+        }
+    )
 
 
 def should_sync_today() -> bool:
@@ -108,6 +170,7 @@ def calculate_portfolio_summary(parsed_data: Dict[str, Any]) -> Dict[str, Any]:
 
 def run_portfolio_sync() -> None:
     """Run one IBKR sync cycle and persist portfolio snapshot safely."""
+    attempt_iso = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     try:
         if not should_sync_today():
             logger.info("IBKR sync skipped: already synced today")
@@ -125,6 +188,11 @@ def run_portfolio_sync() -> None:
         vwce_value = round(_safe_float(summary.get("vwce_value")), 2)
         cndx_value = round(_safe_float(summary.get("cndx_value")), 2)
         cash = round(_safe_float(summary.get("cash")), 2)
+        if total_value <= 0:
+            msg = f"invalid total_value={total_value}; snapshot not written"
+            logger.error("IBKR sync failed: %s", msg)
+            _update_portfolio_sync_state_failed(attempt_iso, msg)
+            return
 
         timestamp = datetime.now(timezone.utc).isoformat()
         conn = db.get_connection()
@@ -153,6 +221,7 @@ def run_portfolio_sync() -> None:
                     "last_sync_timestamp": timestamp,
                 }
             )
+            _update_portfolio_sync_state_success(attempt_iso)
         finally:
             conn.close()
 
@@ -164,6 +233,7 @@ def run_portfolio_sync() -> None:
             cash,
         )
     except Exception as exc:
+        _update_portfolio_sync_state_failed(attempt_iso, str(exc))
         logger.error("IBKR sync failed: %s", exc, exc_info=True)
 
 if __name__ == "__main__":

@@ -6,12 +6,13 @@ import json
 import logging
 import math
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from zoneinfo import ZoneInfo
 
 from alerts import AlertEngine, get_alert_settings
 from app.components import format_percent, format_price, render_warning_messages
@@ -23,6 +24,7 @@ from buying_ladder.storage import load_buying_ladder_settings
 from config import DEFAULT_LOOKBACK_PERIOD
 from db import get_latest_portfolio_snapshot, get_portfolio_history, get_recent_alerts
 from services.market_data import build_market_overview
+from services.portfolio_sync import load_portfolio_sync_state
 
 logger = logging.getLogger(__name__)
 
@@ -313,6 +315,63 @@ def _portfolio_alloc_pct(part: float, total: float) -> float:
     return round(part / total * 100, 1)
 
 
+def _parse_iso_to_utc(value: object) -> Optional[datetime]:
+    if not value or not isinstance(value, str):
+        return None
+    s = value.strip()
+    if not s:
+        return None
+    try:
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+
+
+def _format_sync_time_local(value: object) -> Optional[str]:
+    dt_utc = _parse_iso_to_utc(value)
+    if dt_utc is None:
+        return None
+    try:
+        local_tz = ZoneInfo("Europe/Ljubljana")
+    except Exception:
+        local_tz = timezone.utc
+    return dt_utc.astimezone(local_tz).strftime("%Y-%m-%d %H:%M")
+
+
+def _portfolio_sync_status_line() -> str:
+    try:
+        state = load_portfolio_sync_state()
+    except Exception:
+        logger.exception("Failed to read portfolio sync state.")
+        return "No sync data yet"
+    if not isinstance(state, dict):
+        return "No sync data yet"
+
+    status = str(state.get("status") or "unknown").strip().lower()
+    last_success_raw = state.get("last_successful_sync")
+    last_attempt_raw = state.get("last_attempt")
+
+    last_success_local = _format_sync_time_local(last_success_raw)
+    last_attempt_local = _format_sync_time_local(last_attempt_raw)
+    last_success_utc = _parse_iso_to_utc(last_success_raw)
+
+    if status == "failed":
+        if last_attempt_local:
+            return f"🔴 Last sync FAILED (last attempt: {last_attempt_local})"
+        return "🔴 Last sync FAILED"
+
+    if last_success_utc is None:
+        return "No sync data yet"
+
+    if (datetime.now(timezone.utc) - last_success_utc) > timedelta(hours=24):
+        return f"🟡 Data may be outdated (last sync: {last_success_local or 'unknown'})"
+
+    return f"🟢 Last sync: {last_success_local or 'unknown'} (OK)"
+
+
 def _parse_last_success_timestamp_utc(value: object) -> Optional[datetime]:
     if not value or not isinstance(value, str):
         return None
@@ -516,12 +575,14 @@ def render_portfolio_overview() -> None:
     vwce_pct = _portfolio_alloc_pct(vwce, total)
     cndx_pct = _portfolio_alloc_pct(cndx, total)
     cash_pct = _portfolio_alloc_pct(cash, total)
+    sync_status_line = _portfolio_sync_status_line()
     st.markdown(
         f"""<div class="ft-card">
             <div class="section-title">Portfolio</div>
             <div style="margin-bottom:16px">
                 <div class="metric-label">Total value</div>
                 <div class="metric-value large">{_format_portfolio_eur(total)}</div>
+                <div class="metric-sub">{html.escape(sync_status_line)}</div>
             </div>
             <div class="metrics-row">
                 <div class="metric-box">

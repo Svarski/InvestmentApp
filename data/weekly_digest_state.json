@@ -1,22 +1,22 @@
 {
-  "current_week_key": "2026-W16",
-  "last_sent_week_key": "2026-W16",
-  "last_sent_timestamp": "2026-04-15T23:40:06.166888+02:00",
+  "current_week_key": "2026-W18",
+  "last_sent_week_key": "2026-W18",
+  "last_sent_timestamp": "2026-05-01T21:29:39.890280+02:00",
   "alert_counts": {
     "market_drawdown": 0,
     "portfolio_drop": 0,
     "vix_spike": 0
   },
   "max_drawdown_by_symbol": {
-    "VWCE": -0.05303051221729745,
-    "CNDX": -1.8914747607800388,
+    "VWCE": 0.0,
+    "CNDX": 0.0,
     "SPY": 0.0,
-    "VIX": -46.27439313941015,
-    "DXY": -3.6388666343022646,
-    "TNX": -6.832030383116231
+    "VIX": -46.34460464808281,
+    "DXY": -3.546517907340821,
+    "TNX": -4.7432637676089175
   },
-  "max_vix": 18.170000076293945,
+  "max_vix": 16.780000686645508,
   "portfolio_drop_occurred": false,
   "notable_events": [],
-  "last_daily_digest_date": "2026-04-15"
+  "last_daily_digest_date": "2026-05-01"
 }
