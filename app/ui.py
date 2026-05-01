@@ -48,6 +48,31 @@ _GLOBAL_CSS = """
 [data-testid="stAppViewContainer"] { background: #F7F8FA; }
 [data-testid="stSidebar"] { background: #FFFFFF; border-right: 1px solid #E8EAF0; }
 section.main > div { padding-top: 1.5rem !important; }
+
+/* Reduce top padding */
+.block-container {
+    padding-top: 1.5rem;
+    padding-bottom: 1rem;
+    padding-left: 1rem;
+    padding-right: 1rem;
+}
+
+/* Remove default header spacing */
+header[data-testid="stHeader"] {
+    height: 0rem;
+}
+
+/* Slight upward shift (mobile fix) */
+.stApp {
+    margin-top: -20px;
+}
+
+/* Mobile-specific tweak */
+@media (max-width: 768px) {
+    .block-container {
+        padding-top: 1rem;
+    }
+}
 .ft-card { background: #FFFFFF; border: 1px solid #E8EAF0; border-radius: 14px; padding: 20px 24px; margin-bottom: 14px; }
 .hero-card { background: #EEF3F0; border-radius: 16px; padding: 28px 28px 22px; margin-bottom: 14px; }
 .hero-label { font-size: 11px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: #64748B; margin-bottom: 10px; }
