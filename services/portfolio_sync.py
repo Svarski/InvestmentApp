@@ -178,18 +178,43 @@ def run_portfolio_sync() -> None:
             return
 
         reference_code = ""
-        for attempt in range(1, 4):
+        start_ts = time.monotonic()
+        max_duration_seconds = 300
+        attempt = 0
+        last_error_message = None
+        logger.info("Starting IBKR Flex request with retry window (max 300s)")
+        while (time.monotonic() - start_ts) < max_duration_seconds:
+            attempt += 1
             try:
                 reference_code = request_flex_report()
+                elapsed_success = int(time.monotonic() - start_ts)
+                logger.info("IBKR Flex ready after %ss", elapsed_success)
                 break
             except Exception as exc:
                 message = str(exc)
-                if "[1001]" in message and attempt < 3:
-                    delay_seconds = attempt * 10
-                    logger.warning("IBKR Flex not ready (1001). Retrying... attempt=%s", attempt + 1)
-                    time.sleep(delay_seconds)
-                    continue
-                raise
+                last_error_message = message
+                if attempt == 1:
+                    logger.info("IBKR Flex first attempt failed, entering retry mode")
+                if "[1001]" not in message:
+                    raise
+
+                elapsed = int(time.monotonic() - start_ts)
+                delay_seconds = min(10 * attempt, 60)
+                remaining = max_duration_seconds - elapsed
+                if remaining <= 0:
+                    break
+                sleep_for = min(delay_seconds, remaining)
+                logger.warning(
+                    "IBKR Flex not ready (1001). Retrying... elapsed=%ss next_delay=%ss",
+                    elapsed,
+                    sleep_for,
+                )
+                time.sleep(sleep_for)
+
+        if not reference_code:
+            raise Exception(
+                f"IBKR Flex not ready after retry window (5 minutes). Last error: {last_error_message}"
+            )
         raw_xml = fetch_flex_report(reference_code)
         parsed_data = parse_flex_report(raw_xml)
         positions = parsed_data.get("positions", [])
