@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
@@ -176,7 +177,19 @@ def run_portfolio_sync() -> None:
             logger.info("IBKR sync skipped: already synced today")
             return
 
-        reference_code = request_flex_report()
+        reference_code = ""
+        for attempt in range(1, 4):
+            try:
+                reference_code = request_flex_report()
+                break
+            except Exception as exc:
+                message = str(exc)
+                if "[1001]" in message and attempt < 3:
+                    delay_seconds = attempt * 10
+                    logger.warning("IBKR Flex not ready (1001). Retrying... attempt=%s", attempt + 1)
+                    time.sleep(delay_seconds)
+                    continue
+                raise
         raw_xml = fetch_flex_report(reference_code)
         parsed_data = parse_flex_report(raw_xml)
         positions = parsed_data.get("positions", [])
