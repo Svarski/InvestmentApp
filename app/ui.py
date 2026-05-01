@@ -358,10 +358,23 @@ def _portfolio_sync_status_line() -> str:
     last_attempt_local = _format_sync_time_local(last_attempt_raw)
     last_success_utc = _parse_iso_to_utc(last_success_raw)
 
+    if status == "in_progress":
+        if last_success_local:
+            return f"⏳ Sync in progress... last good data: {last_success_local}"
+        return "⏳ Sync in progress... no previous data yet"
+
     if status == "failed":
-        if last_attempt_local:
-            return f"🔴 Last sync FAILED (last attempt: {last_attempt_local})"
-        return "🔴 Last sync FAILED"
+        if last_success_local:
+            if last_attempt_local:
+                return (
+                    f"🔴 Last sync failed (last attempt: {last_attempt_local}, "
+                    f"showing data from {last_success_local})"
+                )
+            return f"🔴 Last sync failed (showing data from {last_success_local})"
+        return "🔴 Last sync failed (no valid portfolio data yet)"
+
+    if status not in {"success"}:
+        return "No sync data yet"
 
     if last_success_utc is None:
         return "No sync data yet"

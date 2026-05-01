@@ -108,6 +108,18 @@ def _update_portfolio_sync_state_success(now_iso: str) -> None:
     )
 
 
+def _update_portfolio_sync_state_in_progress(now_iso: str) -> None:
+    existing = load_portfolio_sync_state()
+    _save_portfolio_sync_state(
+        {
+            "last_successful_sync": existing.get("last_successful_sync"),
+            "last_attempt": now_iso,
+            "status": "in_progress",
+            "error": None,
+        }
+    )
+
+
 def _update_portfolio_sync_state_failed(now_iso: str, error_message: str) -> None:
     short_error = (error_message or "Unknown error").strip()
     if len(short_error) > 200:
@@ -121,6 +133,10 @@ def _update_portfolio_sync_state_failed(now_iso: str, error_message: str) -> Non
             "error": short_error,
         }
     )
+
+
+def _utc_now_iso_z() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def should_sync_today() -> bool:
@@ -171,51 +187,54 @@ def calculate_portfolio_summary(parsed_data: Dict[str, Any]) -> Dict[str, Any]:
 
 def run_portfolio_sync() -> None:
     """Run one IBKR sync cycle and persist portfolio snapshot safely."""
-    attempt_iso = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     try:
         if not should_sync_today():
             logger.info("IBKR sync skipped: already synced today")
             return
 
-        reference_code = ""
+        _update_portfolio_sync_state_in_progress(_utc_now_iso_z())
+        reference_code = request_flex_report()
+        if not reference_code:
+            raise Exception("IBKR Flex request failed: no reference_code returned")
+        logger.info("IBKR Flex report requested. reference_code=%s", reference_code)
+
+        raw_xml = ""
         start_ts = time.monotonic()
         max_duration_seconds = 300
         attempt = 0
         last_error_message = None
-        logger.info("Starting IBKR Flex request with retry window (max 300s)")
+        logger.info("Starting IBKR Flex polling (max 300s)")
         while (time.monotonic() - start_ts) < max_duration_seconds:
             attempt += 1
             try:
-                reference_code = request_flex_report()
-                elapsed_success = int(time.monotonic() - start_ts)
-                logger.info("IBKR Flex ready after %ss", elapsed_success)
+                raw_xml = fetch_flex_report(reference_code)
+                total_elapsed = int(time.monotonic() - start_ts)
+                logger.info("IBKR Flex report fetched successfully after %ss", total_elapsed)
                 break
             except Exception as exc:
                 message = str(exc)
                 last_error_message = message
-                if attempt == 1:
-                    logger.info("IBKR Flex first attempt failed, entering retry mode")
                 if "[1001]" not in message:
                     raise
 
                 elapsed = int(time.monotonic() - start_ts)
-                delay_seconds = min(10 * attempt, 60)
+                delay_seconds = min(5 * attempt, 30)
                 remaining = max_duration_seconds - elapsed
                 if remaining <= 0:
                     break
                 sleep_for = min(delay_seconds, remaining)
-                logger.warning(
-                    "IBKR Flex not ready (1001). Retrying... elapsed=%ss next_delay=%ss",
+                logger.info(
+                    "IBKR Flex polling... attempt=%s elapsed=%ss next_delay=%ss",
+                    attempt,
                     elapsed,
                     sleep_for,
                 )
                 time.sleep(sleep_for)
 
-        if not reference_code:
+        if not raw_xml:
             raise Exception(
-                f"IBKR Flex not ready after retry window (5 minutes). Last error: {last_error_message}"
+                f"IBKR Flex report not ready after polling window (5 minutes). Last error: {last_error_message}"
             )
-        raw_xml = fetch_flex_report(reference_code)
         parsed_data = parse_flex_report(raw_xml)
         positions = parsed_data.get("positions", [])
         logger.info("IBKR positions count=%d", len(positions))
@@ -229,7 +248,7 @@ def run_portfolio_sync() -> None:
         if total_value <= 0:
             msg = f"invalid total_value={total_value}; snapshot not written"
             logger.error("IBKR sync failed: %s", msg)
-            _update_portfolio_sync_state_failed(attempt_iso, msg)
+            _update_portfolio_sync_state_failed(_utc_now_iso_z(), msg)
             return
 
         timestamp = datetime.now(timezone.utc).isoformat()
@@ -259,7 +278,7 @@ def run_portfolio_sync() -> None:
                     "last_sync_timestamp": timestamp,
                 }
             )
-            _update_portfolio_sync_state_success(attempt_iso)
+            _update_portfolio_sync_state_success(_utc_now_iso_z())
         finally:
             conn.close()
 
@@ -271,7 +290,7 @@ def run_portfolio_sync() -> None:
             cash,
         )
     except Exception as exc:
-        _update_portfolio_sync_state_failed(attempt_iso, str(exc))
+        _update_portfolio_sync_state_failed(_utc_now_iso_z(), str(exc))
         logger.error("IBKR sync failed: %s", exc, exc_info=True)
 
 if __name__ == "__main__":
