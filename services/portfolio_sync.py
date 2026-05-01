@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 import db
+from requests.exceptions import ConnectionError as RequestsConnectionError, ReadTimeout
 from services.ibkr_flex import fetch_flex_report, parse_flex_report, request_flex_report
 
 logging.basicConfig(level=logging.INFO)
@@ -193,9 +194,31 @@ def run_portfolio_sync() -> None:
             return
 
         _update_portfolio_sync_state_in_progress(_utc_now_iso_z())
-        reference_code = request_flex_report()
+        reference_code = ""
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                reference_code = request_flex_report()
+                logger.info("IBKR Flex request succeeded on attempt %s", attempt)
+                break
+            except (ReadTimeout, RequestsConnectionError) as exc:
+                message = str(exc)
+                if attempt < max_attempts:
+                    delay_seconds = attempt * 5
+                    logger.warning(
+                        "IBKR Flex request network error. Retrying... attempt=%s/%s delay=%ss error=%s",
+                        attempt,
+                        max_attempts,
+                        delay_seconds,
+                        message,
+                    )
+                    time.sleep(delay_seconds)
+                    continue
+                raise
+            except Exception:
+                raise
         if not reference_code:
-            raise Exception("IBKR Flex request failed: no reference_code returned")
+            raise Exception("IBKR Flex request failed after retries")
         logger.info("IBKR Flex report requested. reference_code=%s", reference_code)
 
         raw_xml = ""
